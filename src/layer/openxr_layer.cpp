@@ -155,6 +155,9 @@ struct Dispatch {
     PFN_xrAcquireSwapchainImage acquire_swapchain_image{};
     PFN_xrWaitSwapchainImage wait_swapchain_image{};
     PFN_xrReleaseSwapchainImage release_swapchain_image{};
+    // Best-effort: a runtime that does not expose it simply never has a space
+    // destroyed underneath a queued submission through this layer.
+    PFN_xrDestroySpace destroy_space{};
     bool steamvr_runtime{};
     XrVersion runtime_version{};
     std::string runtime_name;
@@ -244,9 +247,24 @@ struct PendingApplicationFrame {
     XrDuration display_period{};
 };
 
+// Windows 10 1803 and later. Declared here so the layer still builds against
+// an SDK that predates it; the create call degrades to a coarse timer.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 struct SessionState {
     explicit SessionState(std::shared_ptr<Dispatch> next_dispatch)
         : dispatch(std::move(next_dispatch)) {}
+
+    ~SessionState() {
+        if (presenter_pace_timer != nullptr) {
+            CloseHandle(presenter_pace_timer);
+        }
+    }
+
+    SessionState(const SessionState&) = delete;
+    SessionState& operator=(const SessionState&) = delete;
 
     std::shared_ptr<Dispatch> dispatch;
     std::unique_ptr<xrfg::OpenXrFpsOverlay> fps_overlay;
@@ -294,6 +312,32 @@ struct SessionState {
     std::deque<std::shared_ptr<PresenterSubmission>> presenter_submissions;
     std::shared_ptr<GeneratedFrameEndInfo> presenter_last_frame;
     std::thread presenter_thread;
+    // When the presenter last handed a frame to the runtime, and the period it
+    // was told to expect. The presenter paces itself against these because
+    // xrWaitFrame cannot be relied on to do it: see pace_presenter_submission.
+    // Guarded by presenter_mutex.
+    // When the next submission is due. Advanced by exactly one period per
+    // submission rather than measured from the previous one, so the loop's own
+    // cost lands as a constant offset instead of accumulating into the
+    // cadence. Chaining each wait off the last submission added about 4.6 ms
+    // of per-cycle overhead to a 10 ms pace and held the runtime to 64/s.
+    std::chrono::steady_clock::time_point presenter_next_submit{};
+    bool presenter_schedule_valid{};
+    // A condition variable waits on the system tick, which is 15.6 ms by
+    // default on Windows. Every pace wait rounded up to that, so an 11.11 ms
+    // schedule produced 15.5 ms submissions and exactly 64/s no matter what
+    // the schedule asked for. A high-resolution timer sleeps to well under a
+    // millisecond without changing the process-wide timer period, which a
+    // layer has no business doing to its host.
+    HANDLE presenter_pace_timer{};
+    // The smallest display period the runtime has reported, which is the one
+    // the hardware actually scans at. Not the latest reported value: SteamVR
+    // returns a multiple of the true period when it considers the caller
+    // behind - 11.1, then 55.6, then 22.2 ms within a few frames - so pacing
+    // against the latest value lets a slow frame widen the pace, which makes
+    // the next frame later still. That spiral throttled the presenter to
+    // 3.7 Hz and froze the session.
+    XrDuration presenter_display_period{};
     XrFrameState presenter_frame_state{XR_TYPE_FRAME_STATE};
     XrTime last_virtual_display_time{};
     XrResult presenter_failure{XR_SUCCESS};
@@ -1130,6 +1174,7 @@ XRAPI_ATTR XrResult XRAPI_CALL layer_create_swapchain(
     const XrSwapchainCreateInfo* create_info,
     XrSwapchain* swapchain);
 XRAPI_ATTR XrResult XRAPI_CALL layer_destroy_swapchain(XrSwapchain swapchain);
+XRAPI_ATTR XrResult XRAPI_CALL layer_destroy_space(XrSpace space);
 XRAPI_ATTR XrResult XRAPI_CALL layer_enumerate_swapchain_images(
     XrSwapchain swapchain,
     std::uint32_t image_capacity_input,
@@ -1207,6 +1252,10 @@ XrResult layer_get_instance_proc_addr_impl(
     }
     if (std::strcmp(name, "xrDestroySwapchain") == 0) {
         return expose_intercept(dispatch, dispatch->destroy_swapchain, layer_destroy_swapchain, function);
+    }
+    if (std::strcmp(name, "xrDestroySpace") == 0) {
+        return expose_intercept(
+            dispatch, dispatch->destroy_space, layer_destroy_space, function);
     }
     if (std::strcmp(name, "xrEnumerateSwapchainImages") == 0) {
         return expose_intercept(
@@ -1288,6 +1337,14 @@ XrResult layer_create_api_layer_instance_impl(
         load_function(next_get_instance_proc_addr, created_instance, "xrEndFrame", dispatch->end_frame) &&
         load_function(next_get_instance_proc_addr, created_instance, "xrCreateSwapchain", dispatch->create_swapchain) &&
         load_function(next_get_instance_proc_addr, created_instance, "xrDestroySwapchain", dispatch->destroy_swapchain) &&
+        // Best effort, deliberately not a load requirement: a runtime without
+        // it keeps working, it just never has a space settled before destroy.
+        (static_cast<void>(load_function(
+             next_get_instance_proc_addr,
+             created_instance,
+             "xrDestroySpace",
+             dispatch->destroy_space)),
+         true) &&
         load_function(
             next_get_instance_proc_addr,
             created_instance,
@@ -2428,6 +2485,104 @@ void fail_pending_presenter_submissions_locked(
     state.outstanding_presenter_submissions = 0;
 }
 
+// Holds the presenter to one submission per display period.
+//
+// The layer submits two frames for every application frame and relies on
+// xrWaitFrame to space them, one per scanout. That holds only while the
+// runtime actually throttles the wait. Measured against MSFS 2024: VDXR
+// blocks it for a metronomic 9.95-9.97 ms and the pair goes out 11.11 ms
+// apart, exactly as intended; SteamVR with the Pimax driver returns it in
+// 1.55 ms, so the presenter free-runs and submits the pair 1.12 ms apart -
+// both inside one 11.11 ms window - followed by a 21.1 ms gap.
+//
+// A compositor holding one submitted frame at a time then never scans out the
+// first of each pair: the second replaces it. Half the generated frames are
+// discarded before they are ever displayed, which is why the layer's own
+// overlay reported a steady 90 while the compositor reported 10% reprojection
+// and about 80 FPS, and why neither pipeline depth nor synthesis readiness
+// moved the result - the frames were being dropped for their timing, never
+// for their contents.
+//
+// Pacing here rather than trusting the wait costs nothing where the wait
+// already paces: the elapsed check passes immediately and the runtime's own
+// blocking still sets the cadence. The wait is interruptible, and it happens
+// before the runtime frame cycle is entered so no begun frame is held open
+// across it. It must not run under presenter_content_mutex - waiting for
+// presenter progress while holding that lock has deadlocked this layer twice.
+void pace_presenter_submission(
+    const std::shared_ptr<SessionState>& state) noexcept {
+    try {
+        const auto entered = std::chrono::steady_clock::now();
+        std::int64_t behind_us = 0;
+        std::chrono::nanoseconds remaining{0};
+        {
+            std::scoped_lock lock(state->presenter_mutex);
+            if (!state->presenter_schedule_valid ||
+                state->presenter_display_period <= 0 ||
+                state->presenter_stop_requested) {
+                return;
+            }
+            const auto period = std::chrono::nanoseconds(
+                static_cast<std::int64_t>(state->presenter_display_period));
+            auto ready_at = state->presenter_next_submit;
+            behind_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    entered - ready_at)
+                    .count();
+            if (ready_at > entered) {
+                // Never hold longer than one period, whatever the schedule
+                // says. Pacing exists to stop submissions bunching up; it must
+                // never be able to hold the presenter back instead.
+                ready_at = std::min(ready_at, entered + period);
+                remaining = ready_at - entered;
+            }
+        }
+        // Slept without the lock: the application thread enqueues against this
+        // mutex, and a paced presenter holding it would stall the very frame
+        // it is waiting for.
+        if (remaining > std::chrono::nanoseconds::zero()) {
+            if (state->presenter_pace_timer == nullptr) {
+                state->presenter_pace_timer = CreateWaitableTimerExW(
+                    nullptr,
+                    nullptr,
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS);
+                if (state->presenter_pace_timer == nullptr) {
+                    // Pre-1803, or the flag was refused. A coarse timer still
+                    // beats the condition variable's tick rounding.
+                    state->presenter_pace_timer = CreateWaitableTimerExW(
+                        nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+                }
+            }
+            if (state->presenter_pace_timer != nullptr) {
+                LARGE_INTEGER due{};
+                // Negative is relative, in 100 ns units.
+                due.QuadPart = -(remaining.count() / 100);
+                if (SetWaitableTimer(
+                        state->presenter_pace_timer,
+                        &due,
+                        0,
+                        nullptr,
+                        nullptr,
+                        FALSE)) {
+                    static_cast<void>(WaitForSingleObject(
+                        state->presenter_pace_timer, INFINITE));
+                }
+            }
+        }
+        xrfg::bridge_flight_logger().event(
+            xrfg::BridgeFlightOperation::presenter_pace,
+            0,
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - entered)
+                    .count()),
+            static_cast<std::uint64_t>(behind_us < 0 ? -behind_us : behind_us),
+            behind_us > 0 ? 1u : 0u);
+    } catch (...) {
+    }
+}
+
 void continuous_presenter_main(
     const std::shared_ptr<SessionState>& state) noexcept {
     for (;;) {
@@ -2437,6 +2592,8 @@ void continuous_presenter_main(
                 break;
             }
         }
+
+        pace_presenter_submission(state);
 
         XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState frame_state{XR_TYPE_FRAME_STATE};
@@ -2466,6 +2623,20 @@ void continuous_presenter_main(
             state->presenter_frame_state = frame_state;
             state->presenter_frame_state.next = nullptr;
             state->presenter_frame_state_valid = true;
+            // Keep the smallest plausible period seen, so a runtime that
+            // inflates the value under load cannot inflate the pace with it.
+            constexpr XrDuration kShortestCredibleDisplayPeriod = 2'000'000;
+            constexpr XrDuration kLongestCredibleDisplayPeriod = 50'000'000;
+            if (frame_state.predictedDisplayPeriod >=
+                    kShortestCredibleDisplayPeriod &&
+                frame_state.predictedDisplayPeriod <=
+                    kLongestCredibleDisplayPeriod &&
+                (state->presenter_display_period == 0 ||
+                 frame_state.predictedDisplayPeriod <
+                     state->presenter_display_period)) {
+                state->presenter_display_period =
+                    frame_state.predictedDisplayPeriod;
+            }
         }
         state->presenter_condition.notify_all();
 
@@ -2553,6 +2724,36 @@ void continuous_presenter_main(
             end_result = state->fps_overlay
                 ? state->fps_overlay->end_frame(&submitted, fresh_synthetic)
                 : state->dispatch->end_frame(state->handle, &submitted);
+            {
+                // Advance the schedule by exactly one period so this loop's
+                // own cost does not compound into the cadence, and resync
+                // rather than chase if a stall has put the schedule in the
+                // past - catching up would submit a burst, which is the very
+                // thing the pace exists to prevent.
+                std::scoped_lock lock(state->presenter_mutex);
+                const auto now = std::chrono::steady_clock::now();
+                const auto period = std::chrono::nanoseconds(
+                    static_cast<std::int64_t>(state->presenter_display_period));
+                if (!state->presenter_schedule_valid ||
+                    state->presenter_display_period <= 0) {
+                    state->presenter_next_submit = now + period;
+                    state->presenter_schedule_valid =
+                        state->presenter_display_period > 0;
+                } else {
+                    state->presenter_next_submit += period;
+                    // Deadlines already missed are stepped over a whole period
+                    // at a time, which keeps the phase and never charges a
+                    // fresh full period for being late. Resetting to now+period
+                    // instead made every cycle cost a period plus whatever the
+                    // loop took, which is how a 11.11 ms pace produced 15.5 ms
+                    // submissions and held the runtime to 64/s.
+                    if (state->presenter_next_submit <= now) {
+                        const auto behind = now - state->presenter_next_submit;
+                        state->presenter_next_submit +=
+                            (behind / period + 1) * period;
+                    }
+                }
+            }
             xrfg::bridge_flight_logger().end(
                 end_token,
                 xrfg::BridgeFlightOperation::internal_end_frame,
@@ -2561,7 +2762,6 @@ void continuous_presenter_main(
                 submitted.layerCount,
                 frame_state.shouldRender);
         }
-
         xrfg::bridge_flight_logger().event(
             xrfg::BridgeFlightOperation::presenter_submission,
             end_result,
@@ -2638,6 +2838,10 @@ void continuous_presenter_main(
             state->presenter_last_frame = std::move(seed_frame);
         }
         state->presenter_frame_state_valid = false;
+        // A schedule left over from a previous presenter would stall the first
+        // submission of this one.
+        state->presenter_schedule_valid = false;
+        state->presenter_display_period = 0;
         state->presenter_stop_requested = false;
         state->presenter_active = true;
         state->presenter_thread = std::thread(continuous_presenter_main, state);
@@ -2655,10 +2859,20 @@ void stop_continuous_presenter(
     }
     try {
         {
-            std::scoped_lock lock(state->presenter_mutex);
+            std::unique_lock lock(state->presenter_mutex);
             if (!state->presenter_active) {
                 return;
             }
+            // Let a submission the application already handed over reach the
+            // runtime instead of dropping it on the floor. The application no
+            // longer waits for this queue to empty, so the last frame of a
+            // session is normally still sitting in it. Bounded, because
+            // teardown must not depend on the presenter being healthy.
+            static_cast<void>(state->presenter_condition.wait_for(
+                lock, std::chrono::milliseconds(100), [&] {
+                    return state->outstanding_presenter_submissions == 0 ||
+                           XR_FAILED(state->presenter_failure);
+                }));
             state->presenter_stop_requested = true;
         }
         state->presenter_condition.notify_all();
@@ -2680,6 +2894,28 @@ void stop_continuous_presenter(
     const std::shared_ptr<SessionState>& state) noexcept {
     std::scoped_lock lock(state->presenter_mutex);
     return state->presenter_active && !state->presenter_stop_requested;
+}
+
+[[nodiscard]] XrResult wait_for_presenter_capacity(
+    const std::shared_ptr<SessionState>& state,
+    std::size_t maximum_outstanding) noexcept {
+    try {
+        std::unique_lock lock(state->presenter_mutex);
+        state->presenter_condition.wait(lock, [&] {
+            return state->outstanding_presenter_submissions <=
+                       maximum_outstanding ||
+                   XR_FAILED(state->presenter_failure) ||
+                   state->presenter_stop_requested;
+        });
+        if (XR_FAILED(state->presenter_failure)) {
+            return state->presenter_failure;
+        }
+        return state->presenter_stop_requested
+            ? XR_ERROR_SESSION_NOT_RUNNING
+            : XR_SUCCESS;
+    } catch (...) {
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
 }
 
 [[nodiscard]] XrResult wait_for_presenter_idle(
@@ -4108,7 +4344,20 @@ XrResult layer_end_frame_impl(
                 presenter_content_lock.unlock();
             }
             if (XR_SUCCEEDED(result) && pipelined_presenter_mode) {
-                result = wait_for_presenter_idle(state);
+                // Let a whole pair stay outstanding. The presenter paces its
+                // submissions a display period apart, so any smaller bound
+                // puts one of those periods on the application's critical
+                // path: waiting for the queue to empty cost both periods and
+                // held it to 36/s, waiting for one cost a single period and
+                // held it to 34.6/s, with 11.93 ms of every 28.9 ms frame
+                // spent blocked here. What should govern the application is
+                // its own virtual wait, one pair per two display periods, and
+                // that only gets to act once this stops pre-empting it.
+                //
+                // The pair enqueued here is drained by the time the next one
+                // arrives, so this bound is a runaway guard rather than part
+                // of the steady-state cadence.
+                result = wait_for_presenter_capacity(state, 2);
             }
         } else if (presenter_first_frame) {
             auto request = enqueue_presenter_submission(
@@ -4366,6 +4615,41 @@ XRAPI_ATTR XrResult XRAPI_CALL layer_create_swapchain(
     XrSwapchain* swapchain) {
     return guard_c_api_boundary([&] {
         return layer_create_swapchain_impl(session, create_info, swapchain);
+    });
+}
+
+// A composition layer names a space, and at any pipeline depth above zero a
+// submission naming one can still be queued when the application destroys it.
+// The runtime then rejects that submission, presenter_failure latches, and
+// every later frame call fails for the life of the session - seen as the
+// session freezing on recentre, which is when MSFS rebuilds its reference
+// space. Settle the presenter first so nothing queued names this handle.
+//
+// Upstream never needed this because the application waited for the queue to
+// empty inside xrEndFrame; it does not any more.
+XRAPI_ATTR XrResult XRAPI_CALL layer_destroy_space(XrSpace space) {
+    return guard_c_api_boundary([&]() -> XrResult {
+        std::shared_ptr<Dispatch> dispatch;
+        std::vector<std::shared_ptr<SessionState>> sessions;
+        {
+            std::scoped_lock lock(g_state_mutex);
+            for (const auto& [handle, session] : g_sessions) {
+                static_cast<void>(handle);
+                if (session) {
+                    sessions.push_back(session);
+                    dispatch = session->dispatch;
+                }
+            }
+        }
+        for (const auto& session : sessions) {
+            if (continuous_presenter_active(session)) {
+                static_cast<void>(wait_for_presenter_idle(session));
+            }
+        }
+        if (!dispatch || dispatch->destroy_space == nullptr) {
+            return XR_ERROR_FUNCTION_UNSUPPORTED;
+        }
+        return dispatch->destroy_space(space);
     });
 }
 

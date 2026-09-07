@@ -46,6 +46,11 @@ enum class BridgeFlightOperation : std::uint32_t {
     presenter_transition,
     nvidia_gpu_stages,
     nvidia_gpu_total,
+    // How long the presenter held itself back before starting a runtime frame
+    // cycle, and how far it was from its own schedule when it did. Without
+    // this the pace and the loop's other costs are indistinguishable inside
+    // one gap between records.
+    presenter_pace,
 };
 
 struct BridgeFlightToken {

@@ -76,6 +76,8 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
         return "nvidia_gpu_stages";
     case BridgeFlightOperation::nvidia_gpu_total:
         return "nvidia_gpu_total";
+    case BridgeFlightOperation::presenter_pace:
+        return "presenter_pace";
     }
     return "unknown";
 }
