@@ -1717,7 +1717,11 @@ int main(int argc, char** argv) {
     }
 
     if (g_steamvr_presenter_mode) {
-        std::array<XrFrameState, 6> application_frames{{
+        // The promotion is requested when the throttled streak completes and
+        // takes effect at the next xrEndFrame, so one more application frame
+        // runs inline at the real rate before the virtual half-rate loop starts.
+        std::array<XrFrameState, 7> application_frames{{
+            {XR_TYPE_FRAME_STATE},
             {XR_TYPE_FRAME_STATE},
             {XR_TYPE_FRAME_STATE},
             {XR_TYPE_FRAME_STATE},
@@ -1726,7 +1730,7 @@ int main(int argc, char** argv) {
             {XR_TYPE_FRAME_STATE},
         }};
         bool frame_sequence_succeeded = true;
-        for (std::size_t index = 0; index < 4; ++index) {
+        for (std::size_t index = 0; index < 5; ++index) {
             frame_sequence_succeeded = frame_sequence_succeeded &&
                 XR_SUCCEEDED(wait_frame(
                     session,
@@ -1746,14 +1750,14 @@ int main(int argc, char** argv) {
             XR_SUCCEEDED(wait_frame(
                 session,
                 &frame_wait_info,
-                &application_frames[4])) &&
-            application_frames[4].predictedDisplayPeriod ==
+                &application_frames[5])) &&
+            application_frames[5].predictedDisplayPeriod ==
                 kFakeDisplayPeriod * 2 &&
-            application_frames[4].predictedDisplayTime >
-                application_frames[3].predictedDisplayTime &&
+            application_frames[5].predictedDisplayTime >
+                application_frames[4].predictedDisplayTime &&
             XR_SUCCEEDED(begin_frame(session, &frame_begin_info)) &&
             capture_fresh_application_image() &&
-            submit_frame(application_frames[4].predictedDisplayTime);
+            submit_frame(application_frames[5].predictedDisplayTime);
 
         XrFrameEndInfo empty_end{XR_TYPE_FRAME_END_INFO};
         if (frame_sequence_succeeded) {
@@ -1761,13 +1765,13 @@ int main(int argc, char** argv) {
                 XR_SUCCEEDED(wait_frame(
                     session,
                     &frame_wait_info,
-                    &application_frames[5])) &&
-                application_frames[5].predictedDisplayPeriod ==
+                    &application_frames[6])) &&
+                application_frames[6].predictedDisplayPeriod ==
                     kFakeDisplayPeriod * 2 &&
-                application_frames[5].predictedDisplayTime >
-                    application_frames[4].predictedDisplayTime &&
+                application_frames[6].predictedDisplayTime >
+                    application_frames[5].predictedDisplayTime &&
                 XR_SUCCEEDED(begin_frame(session, &frame_begin_info));
-            empty_end.displayTime = application_frames[5].predictedDisplayTime;
+            empty_end.displayTime = application_frames[6].predictedDisplayTime;
             empty_end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             frame_sequence_succeeded = frame_sequence_succeeded &&
                 XR_SUCCEEDED(end_frame(session, &empty_end));

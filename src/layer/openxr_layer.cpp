@@ -284,6 +284,7 @@ struct SessionState {
     std::uint32_t pipelined_wait_streak{};
     bool pipelined_presenter_mode{};
     bool pipelined_presenter_start_requested{};
+    bool steamvr_presenter_start_requested{};
     XrFrameState last_inline_frame_state{XR_TYPE_FRAME_STATE};
     bool last_inline_frame_state_valid{};
     std::mutex mutex;
@@ -1604,6 +1605,7 @@ void reset_frame_bookkeeping(const std::shared_ptr<SessionState>& state) {
         state->pipelined_wait_streak = 0;
         state->pipelined_presenter_mode = false;
         state->pipelined_presenter_start_requested = false;
+        state->steamvr_presenter_start_requested = false;
         state->last_inline_frame_state = XrFrameState{XR_TYPE_FRAME_STATE};
         state->last_inline_frame_state_valid = false;
     }
@@ -4054,8 +4056,12 @@ XrResult layer_end_frame_impl(
     const bool frame_had_overlapping_wait =
         state->application_frame_has_overlapping_wait;
     const bool pipelined_presenter_mode = state->pipelined_presenter_mode;
+    // Both promotions hand the presenter its first frame at the top of an
+    // xrEndFrame, before the inline second cycle runs, so the handoff never
+    // overlaps a frame this thread has already submitted.
     const bool pipelined_presenter_start_requested =
-        state->pipelined_presenter_start_requested;
+        state->pipelined_presenter_start_requested ||
+        state->steamvr_presenter_start_requested;
     const bool consume_in_submission_order =
         pipelined_presenter_mode || frame_had_overlapping_wait;
     state->application_frame_in_progress = false;
@@ -4101,6 +4107,7 @@ XrResult layer_end_frame_impl(
                 return XR_ERROR_RUNTIME_FAILURE;
             }
             state->pipelined_presenter_start_requested = false;
+            state->steamvr_presenter_start_requested = false;
             return wait_for_presenter_idle(state);
         };
 
@@ -4458,10 +4465,14 @@ XrResult layer_end_frame_impl(
     } else if (steamvr_wait_requires_continuous_presenter(
                    state,
                    current_cycle)) {
-        auto seed_frame =
-            make_presenter_owned_frame(std::move(current_generated));
-        static_cast<void>(
-            start_continuous_presenter(state, std::move(seed_frame)));
+        // Request the promotion; do not perform it here. submit_current_cycle
+        // has already submitted this frame, so seeding a freshly started
+        // presenter thread with it handed a second owner to composition layers
+        // and private swapchain leases that this frame still holds. The next
+        // xrEndFrame starts the presenter through the same path the pipelined
+        // promotion uses, before the inline cycle runs and with a frame nothing
+        // else has submitted.
+        state->steamvr_presenter_start_requested = true;
     }
     return XR_FAILED(current_cycle.result) ? current_cycle.result : result;
 }
