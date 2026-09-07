@@ -3989,12 +3989,17 @@ struct InternalCycleResult {
         std::scoped_lock lock(state->mutex);
         baseline = state->minimum_runtime_display_period;
         if (baseline > 0) {
+            // Only a wait that actually blocked is evidence that the runtime is
+            // throttling the inline cycle. An inflated predictedDisplayPeriod
+            // says something different: SteamVR widens it when it considers the
+            // *caller* late, so counting it closed a feedback loop: a warm-up
+            // hitch widened the period, the widened period promoted the
+            // presenter, and the promotion hitched harder. UEVR reached the
+            // promotion three frames after its first synthesis on two 20 us
+            // waits, with SteamVR reporting 33.3 ms and then 22.2 ms against an
+            // 11.1 ms baseline, and the GPU hung 4 ms later.
             const XrDuration half_period = baseline / 2;
-            const bool wait_blocked = elapsed_nanoseconds >= half_period;
-            const bool period_expanded =
-                cycle.predicted_display_period > baseline &&
-                cycle.predicted_display_period - baseline >= half_period;
-            throttled = wait_blocked || period_expanded;
+            throttled = elapsed_nanoseconds >= half_period;
         }
         state->steamvr_throttled_wait_streak = throttled
             ? state->steamvr_throttled_wait_streak + 1
