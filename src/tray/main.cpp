@@ -31,7 +31,7 @@ constexpr wchar_t kCleanupArgument[] = L"--cleanup-manual-arm";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT_PTR kTrayId = 1;
 constexpr UINT kArmPollMilliseconds = 250;
-constexpr std::uint32_t kImplementationVersion = 65;
+constexpr std::uint32_t kImplementationVersion = 66;
 constexpr wchar_t kDonateUrl[] = L"https://ko-fi.com/tig3rmast3r";
 
 enum MenuCommand : UINT {
