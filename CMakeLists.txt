@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(XRFrameGenerationBridge VERSION 0.66.0 LANGUAGES CXX)
+project(XRFrameGenerationBridge VERSION 0.68.0 LANGUAGES CXX)
 
 option(XRFG_BUILD_LAYER "Build the Windows OpenXR API layer" ON)
 option(XRFG_BUILD_TESTS "Build the core test executable" ON)
@@ -198,7 +198,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     target_compile_definitions(xrfg_bridge_flight_logger PRIVATE
         NOMINMAX
         WIN32_LEAN_AND_MEAN
-        XRFG_IMPLEMENTATION_VERSION=66)
+        XRFG_IMPLEMENTATION_VERSION=${PROJECT_VERSION_MINOR})
     if(MSVC)
         target_compile_options(xrfg_bridge_flight_logger PRIVATE
             /W4 /permissive- /EHsc)
@@ -293,6 +293,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             user32)
         target_compile_features(OFXRBridgeTray PRIVATE cxx_std_20)
         target_compile_definitions(OFXRBridgeTray PRIVATE
+            XRFG_IMPLEMENTATION_VERSION=${PROJECT_VERSION_MINOR}
             NOMINMAX
             WIN32_LEAN_AND_MEAN
             UNICODE
@@ -382,6 +383,18 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             COMMAND xrfg_layer_call_chain
                 $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>
                 "${CMAKE_CURRENT_BINARY_DIR}/xrfg-layer-call-chain-test.log")
+        add_test(
+            NAME xrfg_layer_presenter_swapchain_lifetime
+            COMMAND xrfg_layer_call_chain
+                $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>
+                "${CMAKE_CURRENT_BINARY_DIR}/xrfg-layer-presenter-swapchain-lifetime.log"
+                flight-destroy-swapchain)
+        add_test(
+            NAME xrfg_layer_presenter_space_lifetime
+            COMMAND xrfg_layer_call_chain
+                $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>
+                "${CMAKE_CURRENT_BINARY_DIR}/xrfg-layer-presenter-space-lifetime.log"
+                steamvr-destroy-space)
 
         add_test(
             NAME xrfg_layer_split_eye_call_chain

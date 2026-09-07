@@ -60,6 +60,10 @@ bool g_d3d11_interop_mode = false;
 bool g_steamvr_runtime_mode = false;
 bool g_steamvr_presenter_mode = false;
 bool g_flight_simulator_mode = false;
+bool g_destroy_pending_swapchain = false;
+bool g_destroy_pending_space = false;
+std::atomic<bool> g_swapchain_destroyed{false};
+std::atomic<unsigned> g_submission_after_destroy{0};
 DWORD g_test_application_thread_id{};
 std::atomic<bool> g_concurrent_acquire_mode{false};
 std::atomic<int> g_concurrent_acquire_count{0};
@@ -403,6 +407,16 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_end_frame(
             std::memory_order_acq_rel)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    if (g_destroy_pending_swapchain && saw_projection &&
+        g_swapchain_destroyed.load(std::memory_order_acquire)) {
+        ++g_submission_after_destroy;
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (g_destroy_pending_space && saw_projection &&
+        record.space != g_valid_composition_space.load(std::memory_order_acquire)) {
+        ++g_submission_after_destroy;
+        return XR_ERROR_HANDLE_INVALID;
+    }
     if (g_flight_simulator_mode && saw_projection &&
         record.space !=
             g_valid_composition_space.load(std::memory_order_acquire)) {
@@ -563,7 +577,16 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_create_swapchain(
     return XR_SUCCESS;
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL fake_destroy_space(XrSpace space) {
+    if (space != g_valid_composition_space.load(std::memory_order_acquire)) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    g_valid_composition_space.store(XR_NULL_HANDLE, std::memory_order_release);
+    return XR_SUCCESS;
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL fake_destroy_swapchain(XrSwapchain) {
+    g_swapchain_destroyed.store(true, std::memory_order_release);
     g_destroy_swapchain_calls.fetch_add(1, std::memory_order_relaxed);
     return XR_SUCCESS;
 }
@@ -719,6 +742,7 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_get_instance_proc_addr(
     XRFG_FAKE_FUNCTION("xrLocateViews", fake_locate_views)
     XRFG_FAKE_FUNCTION("xrCreateSwapchain", fake_create_swapchain)
     XRFG_FAKE_FUNCTION("xrDestroySwapchain", fake_destroy_swapchain)
+    XRFG_FAKE_FUNCTION("xrDestroySpace", fake_destroy_space)
     XRFG_FAKE_FUNCTION("xrEnumerateSwapchainImages", fake_enumerate_swapchain_images)
     XRFG_FAKE_FUNCTION("xrAcquireSwapchainImage", fake_acquire_swapchain_image)
     XRFG_FAKE_FUNCTION("xrWaitSwapchainImage", fake_wait_swapchain_image)
@@ -944,12 +968,16 @@ int main(int argc, char** argv) {
         argc == 4 && std::strcmp(argv[3], "cropped-split-eye") == 0;
     const bool d3d11_double_wide_mode =
         argc == 4 && std::strcmp(argv[3], "d3d11-double-wide") == 0;
-    g_steamvr_presenter_mode =
-        argc == 4 && std::strcmp(argv[3], "steamvr-presenter") == 0;
+    g_destroy_pending_space =
+        argc == 4 && std::strcmp(argv[3], "steamvr-destroy-space") == 0;
+    g_steamvr_presenter_mode = g_destroy_pending_space ||
+        (argc == 4 && std::strcmp(argv[3], "steamvr-presenter") == 0);
     g_steamvr_runtime_mode = g_steamvr_presenter_mode ||
         (argc == 4 && std::strcmp(argv[3], "steamvr-inline") == 0);
-    g_flight_simulator_mode =
-        argc == 4 && std::strcmp(argv[3], "flight-simulator") == 0;
+    g_destroy_pending_swapchain =
+        argc == 4 && std::strcmp(argv[3], "flight-destroy-swapchain") == 0;
+    g_flight_simulator_mode = g_destroy_pending_swapchain ||
+        (argc == 4 && std::strcmp(argv[3], "flight-simulator") == 0);
     g_test_application_thread_id = GetCurrentThreadId();
     g_d3d11_interop_mode = argc == 4 &&
         (std::strcmp(argv[3], "d3d11-interop") == 0 ||
@@ -1068,6 +1096,7 @@ int main(int argc, char** argv) {
     const auto locate_views = get_layer_function<PFN_xrLocateViews>(request.getInstanceProcAddr, "xrLocateViews");
     const auto create_swapchain = get_layer_function<PFN_xrCreateSwapchain>(request.getInstanceProcAddr, "xrCreateSwapchain");
     const auto destroy_swapchain = get_layer_function<PFN_xrDestroySwapchain>(request.getInstanceProcAddr, "xrDestroySwapchain");
+    const auto destroy_space = get_layer_function<PFN_xrDestroySpace>(request.getInstanceProcAddr, "xrDestroySpace");
     const auto enumerate_images = get_layer_function<PFN_xrEnumerateSwapchainImages>(request.getInstanceProcAddr, "xrEnumerateSwapchainImages");
     const auto acquire_image = get_layer_function<PFN_xrAcquireSwapchainImage>(request.getInstanceProcAddr, "xrAcquireSwapchainImage");
     const auto wait_image = get_layer_function<PFN_xrWaitSwapchainImage>(request.getInstanceProcAddr, "xrWaitSwapchainImage");
@@ -1649,10 +1678,12 @@ int main(int argc, char** argv) {
             XR_SUCCEEDED(begin_frame(session, &frame_begin_info)) &&
             submit_flight_frame(application_frames[3]);
 
+        const bool destroyed_before_end_session = g_destroy_pending_swapchain &&
+            XR_SUCCEEDED(destroy_swapchain(swapchain));
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         const bool teardown_succeeded =
             XR_SUCCEEDED(end_session(session)) &&
-            XR_SUCCEEDED(destroy_swapchain(swapchain)) &&
+            (destroyed_before_end_session || XR_SUCCEEDED(destroy_swapchain(swapchain))) &&
             XR_SUCCEEDED(destroy_session(session)) &&
             XR_SUCCEEDED(destroy_instance(instance));
         FreeLibrary(module);
@@ -1692,6 +1723,7 @@ int main(int argc, char** argv) {
         const std::uint32_t downstream_waits =
             g_wait_frame_calls.load(std::memory_order_relaxed);
         const bool valid = sequence_succeeded && teardown_succeeded &&
+            g_submission_after_destroy.load() == 0 &&
             matched_targets == expected_generated_order.size() &&
             composition_preserved && only_optional_teardown_empty &&
             downstream_waits > downstream_waits_before_transition &&
@@ -1704,6 +1736,7 @@ int main(int argc, char** argv) {
             std::cerr << "pipelined presenter validation failed: sequence="
                       << sequence_succeeded << " teardown="
                       << teardown_succeeded << " matched=" << matched_targets
+                      << " after-destroy=" << g_submission_after_destroy.load()
                       << " waits-before=" << downstream_waits_before_transition
                       << " empty=" << empty_frames << " composition="
                       << composition_preserved
@@ -1763,6 +1796,14 @@ int main(int argc, char** argv) {
             capture_fresh_application_image() &&
             submit_frame(application_frames[5].predictedDisplayTime);
 
+        if (g_destroy_pending_space) {
+            frame_sequence_succeeded = frame_sequence_succeeded && destroy_space &&
+                XR_SUCCEEDED(destroy_space(application_space));
+            // The presenter must not autonomously repeat a frame naming the
+            // destroyed space while the application prepares its next frame.
+            std::this_thread::sleep_for(std::chrono::milliseconds(35));
+        }
+
         XrFrameEndInfo empty_end{XR_TYPE_FRAME_END_INFO};
         if (frame_sequence_succeeded) {
             frame_sequence_succeeded =
@@ -1814,6 +1855,7 @@ int main(int argc, char** argv) {
         const std::uint32_t waits =
             g_wait_frame_calls.load(std::memory_order_relaxed);
         const bool valid = frame_sequence_succeeded && teardown_succeeded &&
+            g_submission_after_destroy.load() == 0 &&
             matched_targets == expected_generated_order.size() &&
             waits == g_begin_frame_calls.load(std::memory_order_relaxed) &&
             waits == g_end_frame_calls.load(std::memory_order_relaxed) &&
@@ -1825,6 +1867,7 @@ int main(int argc, char** argv) {
             std::cerr << "SteamVR presenter validation failed: sequence="
                       << frame_sequence_succeeded << " teardown="
                       << teardown_succeeded << " matched=" << matched_targets
+                      << " after-destroy=" << g_submission_after_destroy.load()
                       << " waits=" << waits << " begins="
                       << g_begin_frame_calls.load() << " ends="
                       << g_end_frame_calls.load() << '\n';

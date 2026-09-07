@@ -550,6 +550,13 @@ void stop_continuous_presenter(
     const std::shared_ptr<SessionState>& state) noexcept;
 [[nodiscard]] bool continuous_presenter_active(
     const std::shared_ptr<SessionState>& state) noexcept;
+// Prevent new enqueues, finish queued/in-flight submissions, then retire any
+// autonomous repeat before invalidating an application-owned handle.
+struct PresenterResourceLifetimeGuard {
+    explicit PresenterResourceLifetimeGuard(const std::shared_ptr<SessionState>& state);
+    std::unique_lock<std::mutex> frame_lock;
+    std::unique_lock<std::mutex> content_lock;
+};
 [[nodiscard]] XrDuration doubled_display_period(XrDuration period) noexcept;
 [[nodiscard]] XrTime add_display_duration(
     XrTime time,
@@ -1938,6 +1945,7 @@ XrResult layer_destroy_swapchain_impl(XrSwapchain swapchain) {
         return XR_ERROR_HANDLE_INVALID;
     }
 
+    PresenterResourceLifetimeGuard presenter_guard(state->session);
     std::scoped_lock call_lock(state->call_mutex);
     drain_swapchain_gpu(state);
     destroy_frame_generation_swapchains(state);
@@ -2953,6 +2961,19 @@ void stop_continuous_presenter(
             : XR_SUCCESS;
     } catch (...) {
         return XR_ERROR_RUNTIME_FAILURE;
+    }
+}
+
+PresenterResourceLifetimeGuard::PresenterResourceLifetimeGuard(
+    const std::shared_ptr<SessionState>& state)
+    : frame_lock(state->frame_call_mutex) {
+    if (continuous_presenter_active(state)) {
+        // The content lock must be acquired AFTER the drain: the presenter
+        // needs it to complete the very submissions we are waiting for.
+        static_cast<void>(wait_for_presenter_idle(state));
+        content_lock = std::unique_lock<std::mutex>(state->presenter_content_mutex);
+        std::scoped_lock lock(state->presenter_mutex);
+        state->presenter_last_frame.reset();
     }
 }
 
@@ -4673,13 +4694,16 @@ XRAPI_ATTR XrResult XRAPI_CALL layer_destroy_space(XrSpace space) {
                 }
             }
         }
-        for (const auto& session : sessions) {
-            if (continuous_presenter_active(session)) {
-                static_cast<void>(wait_for_presenter_idle(session));
-            }
-        }
         if (!dispatch || dispatch->destroy_space == nullptr) {
             return XR_ERROR_FUNCTION_UNSUPPORTED;
+        }
+        std::sort(sessions.begin(), sessions.end(), [](const auto& a, const auto& b) {
+            return handle_value(a->handle) < handle_value(b->handle);
+        });
+        std::vector<PresenterResourceLifetimeGuard> guards;
+        guards.reserve(sessions.size());
+        for (const auto& session : sessions) {
+            guards.emplace_back(session);
         }
         return dispatch->destroy_space(space);
     });

@@ -31,7 +31,7 @@ constexpr wchar_t kCleanupArgument[] = L"--cleanup-manual-arm";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT_PTR kTrayId = 1;
 constexpr UINT kArmPollMilliseconds = 250;
-constexpr std::uint32_t kImplementationVersion = 66;
+constexpr std::uint32_t kImplementationVersion = XRFG_IMPLEMENTATION_VERSION;
 constexpr wchar_t kDonateUrl[] = L"https://ko-fi.com/tig3rmast3r";
 
 enum MenuCommand : UINT {
@@ -656,6 +656,8 @@ void handle_command(AppState& state, UINT command) {
             state.window, L"open", kDonateUrl, nullptr, nullptr, SW_SHOWNORMAL);
         break;
     case show_about: {
+        wchar_t version_label[64]{};
+        swprintf_s(version_label, L"OFXR Bridge V%03u", kImplementationVersion);
         TASKDIALOGCONFIG dialog{};
         dialog.cbSize = sizeof(dialog);
         dialog.hwndParent = state.window;
@@ -665,7 +667,7 @@ void handle_command(AppState& state, UINT command) {
                          TDF_USE_HICON_MAIN;
         dialog.dwCommonButtons = TDCBF_CLOSE_BUTTON;
         dialog.pszWindowTitle = kApplicationName;
-        dialog.pszMainInstruction = L"OFXR Bridge V066";
+        dialog.pszMainInstruction = version_label;
         dialog.pszContent =
             L"Licensed under LGPL-3.0-or-later.\r\n\r\n"
             L"<a href=\"https://github.com/tig3rmast3r/OFXR-Bridge\">"
@@ -689,11 +691,12 @@ void handle_command(AppState& state, UINT command) {
                 return S_OK;
             };
         if (FAILED(TaskDialogIndirect(&dialog, nullptr, nullptr, nullptr))) {
+            const std::wstring message = std::wstring(version_label) +
+                L"\r\n\r\nLicense: LGPL-3.0-or-later\r\n"
+                L"https://github.com/tig3rmast3r/OFXR-Bridge";
             MessageBoxW(
                 state.window,
-                L"OFXR Bridge V066\r\n\r\n"
-                L"License: LGPL-3.0-or-later\r\n"
-                L"https://github.com/tig3rmast3r/OFXR-Bridge",
+                message.c_str(),
                 kApplicationName,
                 MB_OK | MB_ICONINFORMATION);
         }
