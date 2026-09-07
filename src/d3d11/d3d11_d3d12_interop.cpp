@@ -491,6 +491,21 @@ struct D3D11D3D12SwapchainInterop::Impl {
             return result;
         }
 
+        // A D3D11 immediate context is not free-threaded, and once the layer
+        // promotes a presenter thread it stops being touched by one thread only:
+        // the presenter runs xrEndFrame, which makes the runtime submit swapchain
+        // images through this same context, while the application thread is still
+        // rendering and running publish() on it. Applications that never expected
+        // a second thread do not turn protection on for themselves - UE4's D3D11
+        // RHI does not - and an unprotected context corrupts under that access,
+        // which surfaces as a GPU fault rather than an error the layer could fail
+        // open on. Enable it for the life of the device; it is never turned back
+        // off because the application may keep its own threads on the context.
+        Microsoft::WRL::ComPtr<ID3D11Multithread> multithread;
+        if (SUCCEEDED(d3d11_context.As(&multithread)) && multithread) {
+            static_cast<void>(multithread->SetMultithreadProtected(TRUE));
+        }
+
         for (ID3D11Texture2D* image : input_sources) {
             source_images.emplace_back(image);
         }
