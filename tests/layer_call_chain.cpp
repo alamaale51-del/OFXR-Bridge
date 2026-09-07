@@ -1746,16 +1746,20 @@ int main(int argc, char** argv) {
                 submit_frame(application_frames[index].predictedDisplayTime);
         }
 
+        // frameWaitInfo and frameBeginInfo are optional in the registry, and the
+        // presenter answers both calls itself rather than forwarding them, so
+        // this frame passes null to keep that path accepting what a runtime
+        // would. Luke Ross's mods call xrWaitFrame(session, NULL, &state).
         frame_sequence_succeeded = frame_sequence_succeeded &&
             XR_SUCCEEDED(wait_frame(
                 session,
-                &frame_wait_info,
+                nullptr,
                 &application_frames[5])) &&
             application_frames[5].predictedDisplayPeriod ==
                 kFakeDisplayPeriod * 2 &&
             application_frames[5].predictedDisplayTime >
                 application_frames[4].predictedDisplayTime &&
-            XR_SUCCEEDED(begin_frame(session, &frame_begin_info)) &&
+            XR_SUCCEEDED(begin_frame(session, nullptr)) &&
             capture_fresh_application_image() &&
             submit_frame(application_frames[5].predictedDisplayTime);
 

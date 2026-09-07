@@ -1685,6 +1685,22 @@ XrResult layer_end_session_impl(XrSession session) {
     return result;
 }
 
+// frameWaitInfo and frameBeginInfo are optional="true" in the OpenXR registry,
+// so a null pointer is valid input that a runtime must accept, and only a
+// non-null one carries a type worth checking. This matters wherever the layer
+// answers a frame call itself instead of forwarding it: the pass-through path
+// hands the pointer to the runtime, which accepts null, while the virtual wait
+// and begin used in presenter and pipelined modes have to accept it too.
+// Rejecting null there fails applications that pass it and only on the runtimes
+// that promote a presenter -- Luke Ross's mods call xrWaitFrame(session, NULL,
+// &state) and drop back to 2D on the XR_ERROR_VALIDATION_FAILURE.
+template <typename Info>
+[[nodiscard]] bool valid_optional_frame_info(
+    const Info* info,
+    XrStructureType expected) noexcept {
+    return info == nullptr || info->type == expected;
+}
+
 XrResult layer_wait_frame_impl(
     XrSession session,
     const XrFrameWaitInfo* wait_info,
@@ -1718,7 +1734,7 @@ XrResult layer_wait_frame_impl(
         }
     }
     if (use_continuous_presenter) {
-        if (wait_info == nullptr || wait_info->type != XR_TYPE_FRAME_WAIT_INFO ||
+        if (!valid_optional_frame_info(wait_info, XR_TYPE_FRAME_WAIT_INFO) ||
             frame_state == nullptr ||
             frame_state->type != XR_TYPE_FRAME_STATE) {
             return XR_ERROR_VALIDATION_FAILURE;
@@ -1752,7 +1768,7 @@ XrResult layer_wait_frame_impl(
         frame_state->predictedDisplayPeriod = virtual_period;
         frame_state->shouldRender = state->presenter_frame_state.shouldRender;
     } else if (use_provisional_pipelined_wait) {
-        if (wait_info == nullptr || wait_info->type != XR_TYPE_FRAME_WAIT_INFO ||
+        if (!valid_optional_frame_info(wait_info, XR_TYPE_FRAME_WAIT_INFO) ||
             frame_state == nullptr ||
             frame_state->type != XR_TYPE_FRAME_STATE) {
             return XR_ERROR_VALIDATION_FAILURE;
@@ -1825,8 +1841,8 @@ XrResult layer_begin_frame_impl(
     XrResult result = XR_ERROR_RUNTIME_FAILURE;
     try {
         if (continuous_presenter_active(state)) {
-            result = begin_info != nullptr &&
-                    begin_info->type == XR_TYPE_FRAME_BEGIN_INFO
+            result = valid_optional_frame_info(
+                    begin_info, XR_TYPE_FRAME_BEGIN_INFO)
                 ? XR_SUCCESS
                 : XR_ERROR_VALIDATION_FAILURE;
         } else if (state->pipelined_presenter_mode) {
