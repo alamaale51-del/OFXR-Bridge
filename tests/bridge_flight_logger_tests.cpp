@@ -50,7 +50,14 @@ struct TempDirectory {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2) {
+        xrfg::BridgeFlightLogger child;
+        child.initialize(argv[1]);
+        child.event(xrfg::BridgeFlightOperation::application_wait_frame, 6, 11, 22, 33);
+        TerminateProcess(GetCurrentProcess(), 73);
+        return 1;
+    }
     try {
         TempDirectory temporary;
 
@@ -70,6 +77,29 @@ int main() {
             "logging_enabled=1\r\n"
             "max_file_mb=1\r\n"
             "flush_each_event=0\r\n");
+
+        wchar_t exe[32768]{};
+        GetModuleFileNameW(nullptr, exe, 32768);
+        std::wstring command = L"\"" + std::wstring(exe) + L"\" \"" + enabled_directory.wstring() + L"\"";
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        require(CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0,
+            nullptr, nullptr, &startup, &process) != FALSE, "child launch failed");
+        const DWORD wait = WaitForSingleObject(process.hProcess, 10000);
+        if (wait != WAIT_OBJECT_0) TerminateProcess(process.hProcess, 74);
+        DWORD code{};
+        GetExitCodeProcess(process.hProcess, &code);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        require(wait == WAIT_OBJECT_0 && code == 73, "child did not terminate as expected");
+        bool persisted = false;
+        for (const auto& item : fs::directory_iterator(enabled_directory)) {
+            if (item.path().extension() == ".log") {
+                persisted |= read(item.path()).find(
+                    "op=app_wait_frame result=6 dur_us=0 a=11 b=22 c=33") != std::string::npos;
+            }
+        }
+        require(persisted, "last recorder event lost after forced termination");
 
         xrfg::BridgeFlightLogger enabled;
         enabled.initialize(enabled_directory);

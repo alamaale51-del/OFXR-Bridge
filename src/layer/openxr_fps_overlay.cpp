@@ -54,6 +54,7 @@ struct OpenXrFpsOverlay::Impl {
     std::uint32_t index{}, width{}, height{}, max_layers{};
     DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
     OverlayPlacement placement{};
+    bool placement_valid{};
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     ComPtr<ID3D12Device> device12;
     ComPtr<ID3D12CommandQueue> queue12;
@@ -290,19 +291,26 @@ struct OpenXrFpsOverlay::Impl {
                 if (view.subImage.imageRect.extent.width <= 0) continue;
                 const auto w = static_cast<std::uint32_t>(view.subImage.imageRect.extent.width);
                 eye_width = eye_width ? std::min(eye_width, w) : w;
+                // The quad uses physical visible bounds, not the source image's
+                // vertical storage direction. Never reorder the submitted FOV.
+                const float down_angle = std::min(view.fov.angleDown, view.fov.angleUp);
+                const float up_angle = std::max(view.fov.angleDown, view.fov.angleUp);
                 if (std::isfinite(view.fov.angleLeft) && std::isfinite(view.fov.angleRight) &&
                     std::isfinite(view.fov.angleDown) && std::isfinite(view.fov.angleUp) &&
                     view.fov.angleLeft < 0 && view.fov.angleRight > 0 &&
-                    view.fov.angleDown < 0 && view.fov.angleUp > 0) {
+                    down_angle < 0 && up_angle > 0 &&
+                    down_angle > -1.57079632679489661923F && up_angle < 1.57079632679489661923F) {
                     left = std::max(left, std::tan(view.fov.angleLeft));
                     right = std::min(right, std::tan(view.fov.angleRight));
-                    down = std::max(down, std::tan(view.fov.angleDown));
-                    up = std::min(up, std::tan(view.fov.angleUp));
+                    down = std::max(down, std::tan(down_angle));
+                    up = std::min(up, std::tan(up_angle));
                 }
             }
         }
-        if (!eye_width || !initialize(eye_width)) return;
+        if (!eye_width) return;
         placement = overlay_placement(position, left, right, down, up);
+        placement_valid = true;
+        if (!initialize(eye_width)) return;
         quad.pose.position = {placement.x, placement.y, placement.z};
         quad.size = {placement.width, placement.height};
         upload(counter.snapshot(now));
@@ -329,11 +337,26 @@ void OpenXrFpsOverlay::reset_metrics() noexcept {
     impl_->counter.reset();
     impl_->image_valid = false;
     impl_->next_refresh = 0;
+    impl_->placement_valid = false;
+}
+
+void OpenXrFpsOverlay::suspend() noexcept {
+    std::scoped_lock lock(impl_->mutex);
+    impl_->disabled = true;
+    impl_->image_valid = false;
+    impl_->counter.reset();
 }
 
 FpsSnapshot OpenXrFpsOverlay::metrics() const noexcept {
     std::scoped_lock lock(impl_->mutex);
     return impl_->counter.snapshot(now_ns());
+}
+
+std::optional<OverlayPlacement> OpenXrFpsOverlay::marker_placement() const noexcept {
+    std::scoped_lock lock(impl_->mutex);
+    if (impl_->disabled || impl_->position == FpsOverlayPosition::off || !impl_->placement_valid)
+        return std::nullopt;
+    return impl_->placement;
 }
 
 XrResult OpenXrFpsOverlay::end_frame(const XrFrameEndInfo* info, bool synthetic) {

@@ -23,6 +23,7 @@ void expect(bool condition, std::string_view description) {
         std::cerr << "FAIL: " << description << '\n';
     }
 }
+
 [[nodiscard]] xrfg::Rgba8 texture(std::size_t x, std::size_t y) noexcept {
     const std::uint32_t hash = static_cast<std::uint32_t>(
         x * 73U + y * 151U + x * y * 19U + (x ^ y) * 37U);
@@ -125,3 +126,4 @@ int main() {
               << flow_error << ", naive MAE=" << naive_error << '\n';
     return EXIT_SUCCESS;
 }
+

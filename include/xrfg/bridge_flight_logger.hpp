@@ -51,6 +51,8 @@ enum class BridgeFlightOperation : std::uint32_t {
     // this the pace and the loop's other costs are indistinguishable inside
     // one gap between records.
     presenter_pace,
+    synthesis_frame_start_wait,
+    embedded_configuration,
 };
 
 struct BridgeFlightToken {

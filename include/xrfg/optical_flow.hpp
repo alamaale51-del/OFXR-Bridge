@@ -47,3 +47,4 @@ struct BidirectionalFlow {
     float consistency_threshold = 1.5F);
 
 }  // namespace xrfg
+

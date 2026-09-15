@@ -6,6 +6,7 @@
 #include <openxr/openxr.h>
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 namespace xrfg {
 
@@ -23,7 +24,13 @@ public:
     void application_frame(const XrFrameEndInfo* info) noexcept;
     [[nodiscard]] XrResult end_frame(const XrFrameEndInfo* info, bool synthetic);
     void reset_metrics() noexcept;
+    // Terminal for this session. Keep resources alive until normal teardown;
+    // stop adding the quad or uploading textures immediately.
+    void suspend() noexcept;
     [[nodiscard]] FpsSnapshot metrics() const noexcept;
+    // Angular counter bounds for a diagnostic burned into the S projection.
+    // Available without a spare runtime quad layer; Off/suspend disables it.
+    [[nodiscard]] std::optional<OverlayPlacement> marker_placement() const noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

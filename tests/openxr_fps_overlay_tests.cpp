@@ -269,9 +269,13 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(260));
                 overlay.application_frame(&info);
                 check(overlay.end_frame(&info, false) == XR_SUCCESS, "position frame");
-                if (std::wstring(name) == L"off") check(observed_count == 1, "live Off failed");
+                if (std::wstring(name) == L"off") {
+                    check(observed_count == 1, "live Off failed");
+                    check(!overlay.marker_placement(), "Off left diagnostic marker enabled");
+                }
                 else {
                     check(observed_count == 2, "position lost overlay");
+                    check(overlay.marker_placement().has_value(), "visible counter has no marker placement");
                     const auto text = std::wstring(name);
                     check((last_pose.position.x < 0) == (text.find(L"left") != text.npos) &&
                           (last_pose.position.y > 0) == (text.find(L"upper") != text.npos), "live quadrant wrong");
@@ -282,9 +286,46 @@ int main(int argc, char** argv) {
             info.layerCount = expected_count = 2;
             check(overlay.end_frame(&info, false) == XR_SUCCESS && observed_count == 2, "exceeded runtime maxLayerCount");
             overlay.reset_metrics(); check(!overlay.metrics().active && overlay.metrics().submitted_fps == 0, "session reset");
+            info.layerCount = expected_count = 1;
+            // Asymmetric/narrow FOV catches accidental fallback to the default
+            // 90-degree placement. Flipping image storage must not move the quad.
+            const auto saved_fov = view.fov;
+            view.fov = {-0.65f, 0.55f, 0.42f, -0.61f};
+            for (auto name : {L"upper_left", L"upper_right", L"lower_left", L"lower_right"}) {
+                write_position(ini, name);
+                std::this_thread::sleep_for(std::chrono::milliseconds(260));
+                overlay.application_frame(&info);
+                check(overlay.end_frame(&info, false) == XR_SUCCESS && observed_count == 2, "normal FOV placement");
+                const auto upright_pose = last_pose;
+                std::swap(view.fov.angleUp, view.fov.angleDown);
+                std::this_thread::sleep_for(std::chrono::milliseconds(260));
+                overlay.application_frame(&info);
+                check(overlay.end_frame(&info, false) == XR_SUCCESS && observed_count == 2, "inverted FOV placement");
+                check(std::abs(last_pose.position.x - upright_pose.position.x) < 1.0e-6f &&
+                      std::abs(last_pose.position.y - upright_pose.position.y) < 1.0e-6f &&
+                      std::abs(last_pose.position.z - upright_pose.position.z) < 1.0e-6f,
+                      "vertical FOV inversion moved the overlay");
+                check(view.fov.angleDown > view.fov.angleUp, "overlay reordered the application's FOV");
+                std::swap(view.fov.angleUp, view.fov.angleDown);
+            }
+            view.fov = saved_fov;
+            write_position(ini, L"upper_right");
+            std::this_thread::sleep_for(std::chrono::milliseconds(260));
+            overlay.application_frame(&info);
+            check(overlay.end_frame(&info, true) == XR_SUCCESS && observed_count == 2, "overlay visible before manual stop");
+            const auto uploads_before_stop = releases;
+            overlay.suspend();
+            check(!overlay.marker_placement(), "manual stop left diagnostic marker enabled");
+            check(overlay.end_frame(&info, false) == XR_SUCCESS && observed_count == 1, "manual stop removes quad immediately");
+            overlay.reset_metrics();
+            std::this_thread::sleep_for(std::chrono::milliseconds(260));
+            overlay.application_frame(&info);
+            check(overlay.end_frame(&info, false) == XR_SUCCESS && observed_count == 1 && releases == uploads_before_stop,
+                  "stopped overlay never uploads/reappears after refresh or metric reset");
         }
         check(created == 1 && destroyed == 1 && space_created == 1 && space_destroyed == 1, "overlay lifetime leak");
         unsupported = true;
+        info.layerCount = expected_count = 2;
         {
             xrfg::OpenXrFpsOverlay overlay(handle<XrInstance>(1), session, 1, get, end,
                 device.Get(), queue.Get(), device11.Get(), ini);

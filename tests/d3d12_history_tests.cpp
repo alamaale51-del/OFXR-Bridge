@@ -1,4 +1,8 @@
 #include "xrfg/d3d12_history.hpp"
+#include "xrfg/bridge_flight_logger.hpp"
+#include "xrfg/dlss_motion_vectors.hpp"
+#include <filesystem>
+#include <fstream>
 #include "xrfg/d3d12_frame_synthesizer.hpp"
 
 #include <windows.h>
@@ -59,6 +63,16 @@ void require_hresult(HRESULT result, const char* operation) {
 
 [[nodiscard]] bool operation_succeeded(HRESULT result) noexcept {
     return SUCCEEDED(result);
+}
+
+void require_frame_start_gate(
+    xrfg::D3D12FrameSynthesizer& synthesizer,
+    const std::string& label) {
+    const HRESULT result = synthesizer.wait_for_previous_submission(500);
+    require(
+        operation_succeeded(result),
+        label + " failed with HRESULT " +
+            std::to_string(static_cast<std::int32_t>(result)));
 }
 
 [[nodiscard]] D3D12_HEAP_PROPERTIES heap_properties(D3D12_HEAP_TYPE type) noexcept {
@@ -750,7 +764,9 @@ void clear_double_wide_pattern(
     UINT width,
     UINT height,
     UINT x,
-    UINT y) noexcept {
+    UINT y,
+    float* mapped_x = nullptr,
+    float* mapped_y = nullptr) noexcept {
     const xrfg::D3D12ImageRect source_rect =
         source.image_rect.width == 0 && source.image_rect.height == 0
             ? xrfg::D3D12ImageRect{0, 0, width, height}
@@ -805,6 +821,12 @@ void clear_double_wide_pattern(
     const float source_y = static_cast<float>(source_rect.offset_y) +
                            source_v * static_cast<float>(source_rect.height) -
                            0.5F;
+    if (mapped_x != nullptr) {
+        *mapped_x = source_x;
+    }
+    if (mapped_y != nullptr) {
+        *mapped_y = source_y;
+    }
     return source_x >= static_cast<float>(source_rect.offset_x) - 0.5F &&
            source_y >= static_cast<float>(source_rect.offset_y) - 0.5F &&
            source_x <= static_cast<float>(source_rect.offset_x + source_rect.width) - 0.5F &&
@@ -968,6 +990,103 @@ void upload_pattern(
             D3D12_RESOURCE_STATE_RENDER_TARGET);
         command_list->ResourceBarrier(1, &to_render_target);
     });
+}
+
+template <typename MotionForPixel>
+[[nodiscard]] ComPtr<ID3D12Resource> create_and_upload_game_motion_field(
+    D3D12WarpFixture& fixture,
+    UINT width,
+    UINT height,
+    MotionForPixel&& motion_for_pixel) {
+    D3D12_RESOURCE_DESC description = stereo_texture_description(width, height);
+    description.Format = DXGI_FORMAT_R32G32_FLOAT;
+    description.Flags = D3D12_RESOURCE_FLAG_NONE;
+    const D3D12_HEAP_PROPERTIES properties =
+        heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+    ComPtr<ID3D12Resource> texture;
+    require_hresult(
+        fixture.device()->CreateCommittedResource(
+            &properties,
+            D3D12_HEAP_FLAG_NONE,
+            &description,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(texture.GetAddressOf())),
+        "ID3D12Device::CreateCommittedResource(game motion)");
+
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, kEyeCount> layouts{};
+    std::array<UINT, kEyeCount> row_counts{};
+    std::array<UINT64, kEyeCount> row_sizes{};
+    UINT64 total_size = 0;
+    get_copy_layouts(
+        fixture.device(),
+        description,
+        &layouts,
+        &row_counts,
+        &row_sizes,
+        &total_size);
+    ComPtr<ID3D12Resource> upload = create_buffer(
+        fixture,
+        D3D12_HEAP_TYPE_UPLOAD,
+        total_size,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* mapped_memory = nullptr;
+    const D3D12_RANGE no_read{0, 0};
+    require_hresult(
+        upload->Map(0, &no_read, &mapped_memory),
+        "ID3D12Resource::Map(game motion upload)");
+    auto* mapped_bytes = static_cast<std::byte*>(mapped_memory);
+    for (UINT eye = 0; eye < kEyeCount; ++eye) {
+        require(row_counts[eye] == height, "unexpected game-motion row count");
+        require(
+            row_sizes[eye] == static_cast<UINT64>(width) * sizeof(float) * 2U,
+            "unexpected game-motion row size");
+        for (UINT y = 0; y < height; ++y) {
+            auto* row = reinterpret_cast<float*>(
+                mapped_bytes + layouts[eye].Offset +
+                static_cast<std::size_t>(y) * layouts[eye].Footprint.RowPitch);
+            for (UINT x = 0; x < width; ++x) {
+                const auto motion = motion_for_pixel(eye, x, y);
+                row[x * 2U] = motion[0];
+                row[x * 2U + 1U] = motion[1];
+            }
+        }
+    }
+    upload->Unmap(0, nullptr);
+    fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
+        for (UINT eye = 0; eye < kEyeCount; ++eye) {
+            D3D12_TEXTURE_COPY_LOCATION source{};
+            source.pResource = upload.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            source.PlacedFootprint = layouts[eye];
+            D3D12_TEXTURE_COPY_LOCATION destination{};
+            destination.pResource = texture.Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destination.SubresourceIndex = eye;
+            command_list->CopyTextureRegion(
+                &destination, 0, 0, 0, &source, nullptr);
+        }
+        const D3D12_RESOURCE_BARRIER ready = transition_barrier(
+            texture.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        command_list->ResourceBarrier(1, &ready);
+    });
+    return texture;
+}
+
+[[nodiscard]] ComPtr<ID3D12Resource> create_and_upload_game_motion(
+    D3D12WarpFixture& fixture,
+    UINT width,
+    UINT height,
+    const std::array<float, kEyeCount>& horizontal_motion) {
+    return create_and_upload_game_motion_field(
+        fixture,
+        width,
+        height,
+        [&](UINT eye, UINT, UINT) {
+            return std::array<float, 2>{horizontal_motion[eye], 0.0F};
+        });
 }
 
 [[nodiscard]] StereoPattern readback_pattern(
@@ -2000,6 +2119,14 @@ void test_rolling_frame_synthesizer(D3D12WarpFixture& fixture) {
             invalid_pair.current_serial == 0 && invalid_pair.fence_value == 0,
         "out-of-range pair submission was not rejected atomically");
 
+    // Release the deliberately blocked queue, then model V090's frame-start
+    // gate before advancing the temporal pair. Submission itself remains
+    // nonblocking and cannot accumulate another complete transaction.
+    require_hresult(gate->Signal(1), "ID3D12Fence::Signal(synthesis gate)");
+    require(
+        operation_succeeded(synthesizer.wait_for_previous_submission(500)),
+        "frame-start synthesis gate did not settle the asynchronous prime");
+
     std::future<SynthesisOutcome> pair_future = std::async(
         std::launch::async,
         [&synthesizer, &capture_b, &static_views] {
@@ -2030,6 +2157,9 @@ void test_rolling_frame_synthesizer(D3D12WarpFixture& fixture) {
             pair_ab.ticket.current_destination_index == 1,
         "A/B synthesis ticket is incorrect");
 
+    require(
+        operation_succeeded(synthesizer.wait_for_previous_submission(500)),
+        "frame-start synthesis gate did not settle the A/B pair");
     xrfg::D3D12FrameSynthesisTicket repeated_pair{};
     const ReprojectionViews repeated_views = make_reprojection_views(0.025F);
     require(
@@ -2057,13 +2187,6 @@ void test_rolling_frame_synthesizer(D3D12WarpFixture& fixture) {
             capture_c.fence_value > capture_b.fence_value,
         "capture C did not preserve A0/B1/C2 rolling chronology");
 
-    xrfg::D3D12HistoryCaptureTicket blocked_capture_d{};
-    require(
-        history->capture(0, &blocked_capture_d) == HRESULT_FROM_WIN32(ERROR_BUSY) &&
-            blocked_capture_d.serial == 0,
-        "history overwrote A at the first wrap before the A/B synthesis fence completed");
-
-    require_hresult(gate->Signal(1), "ID3D12Fence::Signal(synthesis gate)");
     fixture.execute_and_wait([](ID3D12GraphicsCommandList*) {});
 
     require_readback_matches(
@@ -2298,6 +2421,7 @@ void test_stereo_motion_synthesis_beats_same_pixel_blend(
         operation_succeeded(
             synthesizer.submit_prime(capture_a, static_views, 0, &prime)),
         "motion prime submission failed");
+    require_frame_start_gate(synthesizer, "motion frame-start gate");
 
     xrfg::D3D12HistoryCaptureTicket capture_b{};
     require(
@@ -2453,6 +2577,496 @@ void test_stereo_motion_synthesis_beats_same_pixel_blend(
     require(operation_succeeded(history->invalidate()), "motion history invalidate failed");
 }
 
+void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
+    xrfg::configure_dlss_motion_vector_tracking(true);
+    constexpr UINT width = 64;
+    constexpr UINT height = 32;
+    const auto create_texture = [&](UINT texture_width, UINT texture_height, UINT16 slices) {
+        D3D12_RESOURCE_DESC description =
+            stereo_texture_description(texture_width, texture_height);
+        description.DepthOrArraySize = slices;
+        description.Flags = D3D12_RESOURCE_FLAG_NONE;
+        const D3D12_HEAP_PROPERTIES properties = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+        ComPtr<ID3D12Resource> texture;
+        require_hresult(fixture.device()->CreateCommittedResource(
+            &properties, D3D12_HEAP_FLAG_NONE, &description,
+            D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(texture.GetAddressOf())),
+            "create DLSS provenance texture");
+        return texture;
+    };
+    const auto left_output = create_texture(width, height, 1);
+    const auto right_output = create_texture(width, height, 1);
+    const auto motion = create_texture(width / 2, height / 2, 1);
+    const auto xr_output = create_texture(width, height, 2);
+
+    fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
+        xrfg::publish_dlss_motion_vectors({
+            101, left_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
+            0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
+            D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
+        xrfg::publish_dlss_motion_vectors({
+            202, right_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
+            0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
+            D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
+    });
+
+    const auto resolved = xrfg::resolve_dlss_motion_vectors(
+        xr_output.Get(), fixture.queue());
+    require(resolved && resolved->eye_count == 2 && resolved->eyes[0] &&
+            resolved->eyes[1] && resolved->eyes[0]->stream == 101 &&
+            resolved->eyes[1]->stream == 202 &&
+            resolved->eyes[0]->motion_vectors.Get() != motion.Get() &&
+            resolved->eyes[1]->motion_vectors.Get() != motion.Get() &&
+            resolved->eyes[0]->motion_vectors.Get() !=
+                resolved->eyes[1]->motion_vectors.Get() &&
+            resolved->eyes[0]->output_slice == 0 &&
+            resolved->eyes[1]->output_slice == 0,
+        "two DLSS streams were not associated with the XR stereo image");
+
+    // Publish in the opposite order. Eye assignment must remain tied to the
+    // stable first-seen stream order, not to this frame's evaluation order.
+    fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
+        xrfg::publish_dlss_motion_vectors({
+            202, right_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
+            0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
+            D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
+        xrfg::publish_dlss_motion_vectors({
+            101, left_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
+            0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
+            D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
+    });
+    const auto reordered = xrfg::resolve_dlss_motion_vectors(
+        xr_output.Get(), fixture.queue());
+    require(reordered && reordered->eyes[0]->stream == 101 &&
+            reordered->eyes[1]->stream == 202 &&
+            reordered->eyes[0]->serial == 2 &&
+            reordered->eyes[1]->serial == 2,
+        "DLSS stream pairing changed eye assignment with evaluation order");
+
+    const auto tracked = xrfg::dlss_motion_vector_statistics();
+    require(tracked.published == 4 && tracked.snapshot_copies == 4 &&
+            tracked.snapshot_failures == 0 && tracked.matched == 2 &&
+            tracked.resolve_missing_streams == 0 &&
+            tracked.resolve_stale_pairs == 0,
+        "DLSS stream diagnostics did not account for the stereo pair");
+    xrfg::report_dlss_motion_vector_use();
+    const auto used = xrfg::dlss_motion_vector_statistics();
+    require(used.status == xrfg::DlssMotionVectorStatus::used && used.used == 1 &&
+            used.last_used_publication == used.published,
+        "DLSS stream diagnostics did not retain the last successful use");
+    fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
+        xrfg::publish_dlss_motion_vectors({
+            101, left_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
+            0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
+            D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
+    });
+    require(xrfg::dlss_motion_vector_statistics().status ==
+                xrfg::DlssMotionVectorStatus::used,
+        "a new DLSS publication falsely demoted a recently used vector route");
+    xrfg::configure_dlss_motion_vector_tracking(false);
+    require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), fixture.queue()),
+        "disabled DLSS vector tracking still resolved a pair");
+    xrfg::configure_dlss_motion_vector_tracking(true);
+    require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), fixture.queue()),
+        "re-enabled DLSS vector tracking exposed a stale pair");
+
+    const auto publish_alternating_eye = [&](ID3D12Resource* eye_output) {
+        fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
+            xrfg::publish_dlss_motion_vectors({
+                303, eye_output, motion.Get(), fixture.queue(), 0, 0, width, height,
+                0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
+                D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
+        });
+    };
+    publish_alternating_eye(left_output.Get());
+    require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), fixture.queue()),
+        "single DLSS stream resolved before the second eye arrived");
+    publish_alternating_eye(right_output.Get());
+    const auto alternating_ab = xrfg::resolve_dlss_motion_vectors(
+        xr_output.Get(), fixture.queue());
+    require(alternating_ab && alternating_ab->eyes[0] && alternating_ab->eyes[1] &&
+            alternating_ab->eyes[0]->stream == 303 &&
+            alternating_ab->eyes[1]->stream == 303 &&
+            alternating_ab->eyes[0]->serial == 1 &&
+            alternating_ab->eyes[1]->serial == 2 &&
+            alternating_ab->eyes[0]->previous_serial == 0 &&
+            alternating_ab->eyes[1]->previous_serial == 0,
+        "single alternating DLSS stream did not form its first stereo pair");
+    publish_alternating_eye(left_output.Get());
+    require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), fixture.queue()),
+        "single alternating DLSS stream exposed a half-updated stereo pair");
+    publish_alternating_eye(right_output.Get());
+    const auto alternating_cd = xrfg::resolve_dlss_motion_vectors(
+        xr_output.Get(), fixture.queue());
+    require(alternating_cd && alternating_cd->eyes[0] && alternating_cd->eyes[1] &&
+            alternating_cd->eyes[0]->serial == 3 &&
+            alternating_cd->eyes[1]->serial == 4 &&
+            alternating_cd->eyes[0]->previous_serial == 1 &&
+            alternating_cd->eyes[1]->previous_serial == 2,
+        "single alternating DLSS stream lost per-eye temporal continuity");
+    xrfg::configure_dlss_motion_vector_tracking(false);
+    xrfg::retire_dlss_motion_vector_stream(101);
+    xrfg::retire_dlss_motion_vector_stream(202);
+    xrfg::retire_dlss_motion_vector_stream(303);
+}
+
+void test_dlss_motion_vector_gpu_ingress(
+    D3D12WarpFixture& fixture,
+    xrfg::D3D12OpticalFlowBackend backend =
+        xrfg::D3D12OpticalFlowBackend::fidelity_fx) {
+    constexpr UINT width = 256;
+    constexpr UINT height = 128;
+    constexpr UINT motion_width = width / 2;
+    constexpr UINT motion_height = height / 2;
+    constexpr UINT margin = 16;
+    const std::array<int, kEyeCount> translation{8, -8};
+
+    std::array<ComPtr<ID3D12Resource>, 2> sources{
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+    };
+    std::array<ComPtr<ID3D12Resource>, 2> current_destinations{
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+    };
+    std::array<ComPtr<ID3D12Resource>, 1> synthetic_destinations{
+        create_source_texture(fixture, width, height),
+    };
+    std::array<ID3D12Resource*, 2> source_pointers{
+        sources[0].Get(), sources[1].Get()};
+    std::array<ID3D12Resource*, 2> current_destination_pointers{
+        current_destinations[0].Get(), current_destinations[1].Get()};
+    std::array<ID3D12Resource*, 1> synthetic_destination_pointers{
+        synthetic_destinations[0].Get()};
+
+    const StereoPattern previous = translated_motion_pattern(width, height, {0, 0});
+    const StereoPattern current = translated_motion_pattern(width, height, translation);
+    const StereoPattern expected = translated_motion_pattern(width, height, {4, -4});
+    const StereoPattern unscaled_expected = translated_motion_pattern(width, height, {2, -2});
+    const StereoPattern same_pixel_blend = midpoint_pattern(previous, current);
+    upload_pattern(fixture, sources[0].Get(), previous);
+    upload_pattern(fixture, sources[1].Get(), current);
+    ComPtr<ID3D12Resource> game_motion = create_and_upload_game_motion(
+        fixture,
+        motion_width,
+        motion_height,
+        {-static_cast<float>(translation[0]) * motion_width / width,
+         -static_cast<float>(translation[1]) * motion_width / width});
+
+    auto history = std::make_shared<xrfg::D3D12SwapchainHistory>();
+    require(
+        operation_succeeded(history->initialize(
+            fixture.device(), fixture.queue(), source_pointers,
+            D3D12_RESOURCE_STATE_RENDER_TARGET)),
+        "DLSS-motion history initialization failed");
+    xrfg::D3D12FrameSynthesizer synthesizer;
+    require(
+        operation_succeeded(synthesizer.initialize(
+            fixture.device(), fixture.queue(), history,
+            current_destination_pointers, synthetic_destination_pointers,
+            kFormat, D3D12_RESOURCE_STATE_RENDER_TARGET, backend)),
+        "DLSS-motion synthesizer initialization failed");
+
+    auto frame_a = std::make_shared<xrfg::DlssMotionVectorFrame>();
+    frame_a->stream = 17;
+    frame_a->epoch = 3;
+    frame_a->serial = 1;
+    frame_a->motion_vectors = game_motion;
+    frame_a->producer_queue = fixture.queue();
+    frame_a->output_width = width;
+    frame_a->output_height = height;
+    frame_a->motion_width = motion_width;
+    frame_a->motion_height = motion_height;
+    frame_a->resource_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    auto frame_b = std::make_shared<xrfg::DlssMotionVectorFrame>(*frame_a);
+    frame_b->previous_serial = 1;
+    frame_b->serial = 2;
+    auto frame_a_right = std::make_shared<xrfg::DlssMotionVectorFrame>(*frame_a);
+    frame_a_right->motion_slice = 1;
+    auto frame_b_right = std::make_shared<xrfg::DlssMotionVectorFrame>(*frame_b);
+    frame_b_right->motion_slice = 1;
+    auto set_a = std::make_shared<xrfg::DlssMotionVectorSet>();
+    set_a->eye_count = kEyeCount;
+    set_a->eyes = {frame_a, frame_a_right};
+    auto set_b = std::make_shared<xrfg::DlssMotionVectorSet>();
+    set_b->eye_count = kEyeCount;
+    set_b->eyes = {frame_b, frame_b_right};
+
+    const ReprojectionViews views = make_reprojection_views();
+    xrfg::D3D12HistoryCaptureTicket capture_a{};
+    require(
+        operation_succeeded(history->capture(0, &capture_a)) &&
+            operation_succeeded(history->commit(capture_a)),
+        "DLSS-motion capture A failed");
+    xrfg::D3D12FrameSynthesisTicket prime{};
+    require(
+        operation_succeeded(synthesizer.submit_prime(
+            capture_a, views, 0, &prime, set_a)),
+        "DLSS-motion prime failed");
+    require_frame_start_gate(synthesizer, "DLSS-motion frame-start gate");
+
+    xrfg::D3D12HistoryCaptureTicket capture_b{};
+    require(
+        operation_succeeded(history->capture(1, &capture_b)) &&
+            operation_succeeded(history->commit(capture_b)),
+        "DLSS-motion capture B failed");
+    const auto statistics_before = xrfg::dlss_motion_vector_statistics();
+    xrfg::D3D12FrameSynthesisTicket pair{};
+    require(
+        operation_succeeded(synthesizer.submit_pair(
+            capture_b, views, views, 0, 1, &pair, std::nullopt, set_b)),
+        "DLSS-motion pair failed");
+    fixture.execute_and_wait([](ID3D12GraphicsCommandList*) {});
+    const auto statistics_after = xrfg::dlss_motion_vector_statistics();
+    require(
+        statistics_after.used == statistics_before.used + 1 &&
+            statistics_after.status == xrfg::DlssMotionVectorStatus::used,
+        "DLSS-motion path was not selected by the GPU synthesizer");
+
+    const StereoPattern actual = readback_pattern(
+        fixture, synthetic_destinations[0].Get(),
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // The normal backend invocation above proves shader sampling. The NVIDIA
+    // fixture reuses this case specifically to exercise its extra work-list
+    // lifetime while game motion bypasses OFA; rounding can make its confidence
+    // result byte-identical to the smooth same-pixel reference.
+    if (backend != xrfg::D3D12OpticalFlowBackend::nvidia) {
+        require(actual != same_pixel_blend,
+            "DLSS-motion texture was not consumed by the synthesis shader");
+    }
+    for (UINT eye = 0; eye < kEyeCount; ++eye) {
+        const double actual_error = mean_absolute_rgb_error(
+            actual, expected, width, height, eye, margin);
+        const double blend_error = mean_absolute_rgb_error(
+            same_pixel_blend, expected, width, height, eye, margin);
+        const double unscaled_error = mean_absolute_rgb_error(
+            actual, unscaled_expected, width, height, eye, margin);
+        const double previous_error = mean_absolute_rgb_error(
+            previous, expected, width, height, eye, margin);
+        const double current_error = mean_absolute_rgb_error(
+            current, expected, width, height, eye, margin);
+        std::cout << "DLSS motion eye=" << eye
+                  << " synthetic_mae=" << actual_error
+                  << " unscaled_mae=" << unscaled_error
+                  << " blend_mae=" << blend_error << '\n';
+        require(
+            actual_error < 0.05 && actual_error < unscaled_error &&
+                actual_error < previous_error && actual_error < current_error,
+            "DLSS-motion low-resolution vectors were not exactly converted to output space for eye " +
+                std::to_string(eye));
+    }
+
+    // Exercise enough advancing pairs to reuse a work slot. NVIDIA owns an
+    // additional OFA command list per slot even though this path bypasses OFA.
+    std::uint64_t guide_serial = frame_b->serial;
+    for (UINT iteration = 0; iteration < 3; ++iteration) {
+        const std::uint32_t source_index = iteration % 2U;
+        xrfg::D3D12HistoryCaptureTicket capture{};
+        require(
+            operation_succeeded(history->capture(source_index, &capture)) &&
+                operation_succeeded(history->commit(capture)),
+            "DLSS-motion slot-reuse capture failed");
+        auto guide_left = std::make_shared<xrfg::DlssMotionVectorFrame>(*frame_b);
+        guide_left->previous_serial = guide_serial;
+        guide_left->serial = ++guide_serial;
+        auto guide_right = std::make_shared<xrfg::DlssMotionVectorFrame>(*guide_left);
+        guide_right->motion_slice = 1;
+        auto guide = std::make_shared<xrfg::DlssMotionVectorSet>();
+        guide->eye_count = kEyeCount;
+        guide->eyes = {guide_left, guide_right};
+        xrfg::D3D12FrameSynthesisTicket advancing{};
+        require(
+            operation_succeeded(synthesizer.submit_pair(
+                capture, views, views, 0, source_index, &advancing,
+                std::nullopt, guide)),
+            "DLSS-motion work-slot reuse failed");
+        fixture.execute_and_wait([](ID3D12GraphicsCommandList*) {});
+    }
+    require(
+        operation_succeeded(synthesizer.wait_for_idle()),
+        "DLSS-motion final drain failed");
+    require(
+        operation_succeeded(history->invalidate()),
+        "DLSS-motion history invalidate failed");
+}
+
+void test_dlss_motion_vector_strafe_rejects_double_edges(
+    D3D12WarpFixture& fixture) {
+    constexpr UINT width = 256;
+    constexpr UINT height = 128;
+    constexpr UINT object_width = 64;
+    constexpr UINT object_top = 32;
+    constexpr UINT object_bottom = 96;
+    const std::array<int, kEyeCount> previous_left{48, 144};
+    const std::array<int, kEyeCount> displacement{32, -32};
+    const std::array<RgbaBytes, kEyeCount> background{
+        RgbaBytes{12, 20, 28, 255},
+        RgbaBytes{20, 12, 32, 255}};
+    const RgbaBytes foreground{238, 222, 56, 255};
+
+    const auto make_scene = [&](bool current) {
+        StereoPattern pattern;
+        for (UINT eye = 0; eye < kEyeCount; ++eye) {
+            auto& bytes = pattern[eye];
+            bytes.resize(static_cast<std::size_t>(width) * height * kBytesPerPixel);
+            const int left = previous_left[eye] +
+                (current ? displacement[eye] : 0);
+            const int right = left + static_cast<int>(object_width);
+            for (UINT y = 0; y < height; ++y) {
+                for (UINT x = 0; x < width; ++x) {
+                    const bool object = y >= object_top && y < object_bottom &&
+                        static_cast<int>(x) >= left && static_cast<int>(x) < right;
+                    const auto& color = object ? foreground : background[eye];
+                    const std::size_t offset =
+                        (static_cast<std::size_t>(y) * width + x) * kBytesPerPixel;
+                    std::copy(color.begin(), color.end(), bytes.begin() + offset);
+                }
+            }
+        }
+        return pattern;
+    };
+
+    const StereoPattern previous = make_scene(false);
+    const StereoPattern current = make_scene(true);
+    auto game_motion = create_and_upload_game_motion_field(
+        fixture, width, height, [&](UINT eye, UINT x, UINT y) {
+            const int left = previous_left[eye] + displacement[eye];
+            const int right = left + static_cast<int>(object_width);
+            const bool object = y >= object_top && y < object_bottom &&
+                static_cast<int>(x) >= left && static_cast<int>(x) < right;
+            return std::array<float, 2>{
+                object ? static_cast<float>(-displacement[eye]) : 0.0F,
+                0.0F};
+        });
+
+    std::array<ComPtr<ID3D12Resource>, 2> sources{
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height)};
+    std::array<ComPtr<ID3D12Resource>, 2> current_destinations{
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height)};
+    std::array<ComPtr<ID3D12Resource>, 1> synthetic_destinations{
+        create_source_texture(fixture, width, height)};
+    upload_pattern(fixture, sources[0].Get(), previous);
+    upload_pattern(fixture, sources[1].Get(), current);
+    std::array<ID3D12Resource*, 2> source_pointers{
+        sources[0].Get(), sources[1].Get()};
+    std::array<ID3D12Resource*, 2> current_pointers{
+        current_destinations[0].Get(), current_destinations[1].Get()};
+    std::array<ID3D12Resource*, 1> synthetic_pointers{
+        synthetic_destinations[0].Get()};
+
+    auto history = std::make_shared<xrfg::D3D12SwapchainHistory>();
+    require(operation_succeeded(history->initialize(
+                fixture.device(), fixture.queue(), source_pointers,
+                D3D12_RESOURCE_STATE_RENDER_TARGET)),
+        "strafe history initialization failed");
+    xrfg::D3D12FrameSynthesizer synthesizer;
+    require(operation_succeeded(synthesizer.initialize(
+                fixture.device(), fixture.queue(), history, current_pointers,
+                synthetic_pointers, kFormat,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                xrfg::D3D12OpticalFlowBackend::fidelity_fx)),
+        "strafe synthesizer initialization failed");
+
+    auto frame_a = std::make_shared<xrfg::DlssMotionVectorFrame>();
+    frame_a->stream = 301;
+    frame_a->epoch = 7;
+    frame_a->serial = 1;
+    frame_a->motion_vectors = game_motion;
+    frame_a->producer_queue = fixture.queue();
+    frame_a->output_width = width;
+    frame_a->output_height = height;
+    frame_a->motion_width = width;
+    frame_a->motion_height = height;
+    frame_a->resource_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    auto frame_b = std::make_shared<xrfg::DlssMotionVectorFrame>(*frame_a);
+    frame_b->previous_serial = 1;
+    frame_b->serial = 2;
+    auto frame_a_right = std::make_shared<xrfg::DlssMotionVectorFrame>(*frame_a);
+    frame_a_right->stream = 302;
+    frame_a_right->motion_slice = 1;
+    auto frame_b_right = std::make_shared<xrfg::DlssMotionVectorFrame>(*frame_b);
+    frame_b_right->stream = 302;
+    frame_b_right->motion_slice = 1;
+    auto set_a = std::make_shared<xrfg::DlssMotionVectorSet>();
+    set_a->eye_count = kEyeCount;
+    set_a->eyes = {frame_a, frame_a_right};
+    auto set_b = std::make_shared<xrfg::DlssMotionVectorSet>();
+    set_b->eye_count = kEyeCount;
+    set_b->eyes = {frame_b, frame_b_right};
+
+    const ReprojectionViews views = make_reprojection_views();
+    xrfg::D3D12HistoryCaptureTicket capture_a{};
+    require(operation_succeeded(history->capture(0, &capture_a)) &&
+            operation_succeeded(history->commit(capture_a)),
+        "strafe capture A failed");
+    xrfg::D3D12FrameSynthesisTicket prime{};
+    require(operation_succeeded(synthesizer.submit_prime(
+                capture_a, views, 0, &prime, set_a)),
+        "strafe prime failed");
+    require_frame_start_gate(synthesizer, "strafe frame-start gate");
+    xrfg::D3D12HistoryCaptureTicket capture_b{};
+    require(operation_succeeded(history->capture(1, &capture_b)) &&
+            operation_succeeded(history->commit(capture_b)),
+        "strafe capture B failed");
+    xrfg::D3D12FrameSynthesisTicket pair{};
+    require(operation_succeeded(synthesizer.submit_pair(
+                capture_b, views, views, 0, 1, &pair, std::nullopt, set_b)),
+        "strafe pair failed");
+    fixture.execute_and_wait([](ID3D12GraphicsCommandList*) {});
+
+    const StereoPattern actual = readback_pattern(
+        fixture, synthetic_destinations[0].Get(),
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const StereoPattern same_pixel_blend = midpoint_pattern(previous, current);
+    std::array<std::size_t, kEyeCount> double_edge_pixels{};
+    std::array<std::size_t, kEyeCount> baseline_double_edge_pixels{};
+    for (UINT eye = 0; eye < kEyeCount; ++eye) {
+        const int minimum_x = std::min(previous_left[eye],
+            previous_left[eye] + displacement[eye]) - 2;
+        const int maximum_x = std::max(previous_left[eye],
+            previous_left[eye] + displacement[eye]) +
+            static_cast<int>(object_width) + 2;
+        for (UINT y = object_top + 4; y < object_bottom - 4; ++y) {
+            for (int x = minimum_x; x < maximum_x; ++x) {
+                const std::size_t offset =
+                    (static_cast<std::size_t>(y) * width +
+                        static_cast<UINT>(x)) * kBytesPerPixel;
+                const auto distance = [&](const RgbaBytes& color) {
+                    return std::abs(static_cast<int>(actual[eye][offset]) - color[0]) +
+                        std::abs(static_cast<int>(actual[eye][offset + 1]) - color[1]) +
+                        std::abs(static_cast<int>(actual[eye][offset + 2]) - color[2]);
+                };
+                if (std::min(distance(background[eye]), distance(foreground)) > 24) {
+                    ++double_edge_pixels[eye];
+                }
+                const auto baseline_distance = [&](const RgbaBytes& color) {
+                    return std::abs(static_cast<int>(same_pixel_blend[eye][offset]) - color[0]) +
+                        std::abs(static_cast<int>(same_pixel_blend[eye][offset + 1]) - color[1]) +
+                        std::abs(static_cast<int>(same_pixel_blend[eye][offset + 2]) - color[2]);
+                };
+                if (std::min(baseline_distance(background[eye]),
+                        baseline_distance(foreground)) > 24) {
+                    ++baseline_double_edge_pixels[eye];
+                }
+            }
+        }
+        std::cout << "DLSS strafe eye=" << eye
+                  << " double_edge_pixels=" << double_edge_pixels[eye]
+                  << " same_pixel_baseline=" << baseline_double_edge_pixels[eye] << '\n';
+        require(double_edge_pixels[eye] * 2 <=
+                baseline_double_edge_pixels[eye] + 64,
+            "DLSS strafe did not remove the motion-compensable double edge for eye " +
+                std::to_string(eye));
+    }
+    require(operation_succeeded(synthesizer.wait_for_idle()),
+        "strafe final drain failed");
+    require(operation_succeeded(history->invalidate()),
+        "strafe history invalidate failed");
+}
+
 void test_rotation_aware_synthesis_beats_uncompensated_flow(
     D3D12WarpFixture& fixture,
     xrfg::D3D12OpticalFlowBackend backend =
@@ -2477,7 +3091,9 @@ void test_rotation_aware_synthesis_beats_uncompensated_flow(
                                 const ReprojectionViews& source_views_b,
                                 const ReprojectionViews& target_views,
                                 const StereoPattern& input_previous,
-                                const StereoPattern& input_current) {
+                                const StereoPattern& input_current,
+                                std::shared_ptr<const xrfg::DlssMotionVectorSet> motion_a = {},
+                                std::shared_ptr<const xrfg::DlssMotionVectorSet> motion_b = {}) {
         std::array<ComPtr<ID3D12Resource>, 2> sources{
             create_source_texture(fixture, kRotationWidth, kRotationHeight),
             create_source_texture(fixture, kRotationWidth, kRotationHeight),
@@ -2530,7 +3146,6 @@ void test_rotation_aware_synthesis_beats_uncompensated_flow(
                 backend,
                 nvidia_options)),
             std::string(label) + " synthesizer initialization failed");
-
         xrfg::D3D12HistoryCaptureTicket capture_a{};
         require(
             operation_succeeded(history->capture(0, &capture_a)) &&
@@ -2542,8 +3157,11 @@ void test_rotation_aware_synthesis_beats_uncompensated_flow(
                 capture_a,
                 source_views_a,
                 0,
-                &prime)),
+                &prime,
+                std::move(motion_a))),
             std::string(label) + " prime submission failed");
+        require_frame_start_gate(
+            synthesizer, std::string(label) + " frame-start gate");
 
         xrfg::D3D12HistoryCaptureTicket capture_b{};
         require(
@@ -2558,7 +3176,9 @@ void test_rotation_aware_synthesis_beats_uncompensated_flow(
                 target_views,
                 0,
                 1,
-                &pair)),
+                &pair,
+                std::nullopt,
+                std::move(motion_b))),
             std::string(label) + " pair submission failed");
         require(
             pair.previous_serial == capture_a.serial &&
@@ -2636,6 +3256,68 @@ void test_rotation_aware_synthesis_beats_uncompensated_flow(
         views_b,
         previous,
         current);
+    // Feed a dense B-to-A field that already includes the complete projective
+    // head rotation. Subtracting the pose as a linear pixel displacement is
+    // only an approximation and leaves rotation residue. The shader must map
+    // the source endpoint back through the exact inverse OpenXR camera map.
+    ComPtr<ID3D12Resource> pose_inclusive_game_motion =
+        create_and_upload_game_motion_field(
+            fixture,
+            kRotationWidth,
+            kRotationHeight,
+            [&](UINT eye, UINT x, UINT y) {
+                float source_x = static_cast<float>(x);
+                float source_y = static_cast<float>(y);
+                const bool valid = target_pixel_maps_to_source(
+                    views_a[eye],
+                    views_b[eye],
+                    kRotationWidth,
+                    kRotationHeight,
+                    x,
+                    y,
+                    &source_x,
+                    &source_y);
+                return valid
+                    ? std::array<float, 2>{
+                          source_x - static_cast<float>(x),
+                          source_y - static_cast<float>(y)}
+                    : std::array<float, 2>{0.0F, 0.0F};
+            });
+    auto game_frame_a = std::make_shared<xrfg::DlssMotionVectorFrame>();
+    game_frame_a->stream = 31;
+    game_frame_a->epoch = 1;
+    game_frame_a->serial = 1;
+    game_frame_a->motion_vectors = pose_inclusive_game_motion;
+    game_frame_a->producer_queue = fixture.queue();
+    game_frame_a->output_width = kRotationWidth;
+    game_frame_a->output_height = kRotationHeight;
+    game_frame_a->motion_width = kRotationWidth;
+    game_frame_a->motion_height = kRotationHeight;
+    game_frame_a->resource_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    auto game_frame_b = std::make_shared<xrfg::DlssMotionVectorFrame>(*game_frame_a);
+    game_frame_b->previous_serial = 1;
+    game_frame_b->serial = 2;
+    auto game_frame_a_right = std::make_shared<xrfg::DlssMotionVectorFrame>(*game_frame_a);
+    game_frame_a_right->stream = 32;
+    game_frame_a_right->motion_slice = 1;
+    auto game_frame_b_right = std::make_shared<xrfg::DlssMotionVectorFrame>(*game_frame_b);
+    game_frame_b_right->stream = 32;
+    game_frame_b_right->motion_slice = 1;
+    auto game_set_a = std::make_shared<xrfg::DlssMotionVectorSet>();
+    game_set_a->eye_count = kEyeCount;
+    game_set_a->eyes = {game_frame_a, game_frame_a_right};
+    auto game_set_b = std::make_shared<xrfg::DlssMotionVectorSet>();
+    game_set_b->eye_count = kEyeCount;
+    game_set_b->eyes = {game_frame_b, game_frame_b_right};
+    const StereoPattern game_pose_separated = synthesize(
+        "DLSS iterative endpoint inversion",
+        views_a,
+        views_b,
+        views_b,
+        previous,
+        current,
+        game_set_a,
+        game_set_b);
     const StereoPattern uncompensated = synthesize(
         "uncompensated-flow baseline",
         identity_views,
@@ -2673,6 +3355,13 @@ void test_rotation_aware_synthesis_beats_uncompensated_flow(
             kRotationHeight,
             eye,
             kEvaluationMargin);
+        const double game_pose_error = mean_absolute_rgb_error(
+            game_pose_separated,
+            current,
+            kRotationWidth,
+            kRotationHeight,
+            eye,
+            kEvaluationMargin);
         double uncovered_total = 0.0;
         std::size_t uncovered_samples = 0;
         for (UINT y = 0; y < kRotationHeight; ++y) {
@@ -2702,6 +3391,7 @@ void test_rotation_aware_synthesis_beats_uncompensated_flow(
             uncovered_total / static_cast<double>(uncovered_samples);
         std::cout << "rotation eye=" << eye
                   << " aware_mae=" << aware_error
+                  << " game_pose_mae=" << game_pose_error
                   << " uncompensated_flow_mae=" << uncompensated_error
                   << " blend_mae=" << blend_error
                   << " previous_mae=" << previous_error
@@ -2715,6 +3405,11 @@ void test_rotation_aware_synthesis_beats_uncompensated_flow(
                 std::to_string(eye) + ": aware=" + std::to_string(aware_error) +
                 " uncompensated=" + std::to_string(uncompensated_error) +
                 " uncovered=" + std::to_string(uncovered_error));
+        require(
+            game_pose_error <= 1.0,
+            "DLSS vectors retained projective OpenXR rotation residue for eye " +
+                std::to_string(eye) + ": game_pose=" +
+                std::to_string(game_pose_error));
     }
 
     validate_cropped_viewport();
@@ -2794,6 +3489,7 @@ void test_double_wide_single_slice_views(
         operation_succeeded(synthesizer.submit_prime(
             capture, views, 0, &prime)),
         "double-wide prime failed");
+    require_frame_start_gate(synthesizer, "double-wide frame-start gate");
     xrfg::D3D12FrameSynthesisTicket repeated{};
     require(
         operation_succeeded(synthesizer.submit_pair(
@@ -2865,11 +3561,264 @@ void test_double_wide_single_slice_views(
         "double-wide history invalidate failed");
 }
 
+void test_submission_backpressure_and_recovery(
+    D3D12WarpFixture& fixture,
+    xrfg::D3D12OpticalFlowBackend backend,
+    xrfg::D3D12NvidiaOpticalFlowOptions nvidia_options = {}) {
+    constexpr UINT width = 1024;
+    constexpr UINT height = 512;
+    std::array<ComPtr<ID3D12Resource>, 3> sources{
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+    };
+    std::array<ComPtr<ID3D12Resource>, 3> current_destinations{
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+    };
+    std::array<ComPtr<ID3D12Resource>, 2> synthetic_destinations{
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+    };
+    std::array<ID3D12Resource*, 3> source_pointers{
+        sources[0].Get(), sources[1].Get(), sources[2].Get()};
+    std::array<ID3D12Resource*, 3> current_destination_pointers{
+        current_destinations[0].Get(), current_destinations[1].Get(),
+        current_destinations[2].Get()};
+    std::array<ID3D12Resource*, 2> synthetic_destination_pointers{
+        synthetic_destinations[0].Get(), synthetic_destinations[1].Get()};
+
+    upload_pattern(
+        fixture, sources[0].Get(),
+        translated_motion_pattern(width, height, {0, 0}));
+    upload_pattern(
+        fixture, sources[1].Get(),
+        translated_motion_pattern(width, height, {16, -16}));
+    upload_pattern(
+        fixture, sources[2].Get(),
+        translated_motion_pattern(width, height, {32, -32}));
+
+    auto history = std::make_shared<xrfg::D3D12SwapchainHistory>();
+    require(
+        operation_succeeded(history->initialize(
+            fixture.device(), fixture.queue(), source_pointers,
+            D3D12_RESOURCE_STATE_RENDER_TARGET)),
+        "backpressure history initialization failed");
+    xrfg::D3D12FrameSynthesizer synthesizer;
+    require(
+        operation_succeeded(synthesizer.initialize(
+            fixture.device(), fixture.queue(), history,
+            current_destination_pointers, synthetic_destination_pointers,
+            kFormat, D3D12_RESOURCE_STATE_RENDER_TARGET,
+            backend, nvidia_options)),
+        "backpressure synthesizer initialization failed");
+
+    ComPtr<ID3D12Fence> gate;
+    require_hresult(
+        fixture.device()->CreateFence(
+            0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(gate.GetAddressOf())),
+        "ID3D12Device::CreateFence(backpressure gate)");
+    require_hresult(
+        fixture.queue()->Wait(gate.Get(), 1),
+        "ID3D12CommandQueue::Wait(backpressure gate)");
+
+    const ReprojectionViews views = make_reprojection_views();
+    xrfg::D3D12HistoryCaptureTicket capture_a{};
+    require(
+        operation_succeeded(history->capture(0, &capture_a)) &&
+            operation_succeeded(history->commit(capture_a)),
+        "backpressure capture A failed");
+    xrfg::D3D12FrameSynthesisTicket prime{};
+    require(
+        operation_succeeded(
+            synthesizer.submit_prime(capture_a, views, 0, &prime)),
+        "backpressure prime failed");
+
+    xrfg::D3D12HistoryCaptureTicket capture_b{};
+    require(
+        operation_succeeded(history->capture(1, &capture_b)) &&
+            operation_succeeded(history->commit(capture_b)),
+        "backpressure capture B failed");
+    xrfg::D3D12FrameSynthesisTicket pair_ab{};
+    const auto immediate_started = std::chrono::steady_clock::now();
+    const HRESULT immediate_result = synthesizer.submit_pair(
+        capture_b, views, views, 0, 1, &pair_ab);
+    const auto immediate_elapsed =
+        std::chrono::steady_clock::now() - immediate_started;
+    require(
+        immediate_result == HRESULT_FROM_WIN32(ERROR_BUSY) &&
+            pair_ab.fence_value == 0 &&
+            immediate_elapsed < std::chrono::milliseconds(50),
+        "end-of-frame submission did not reject queued bridge work immediately");
+
+    const auto blocked_started = std::chrono::steady_clock::now();
+    const HRESULT blocked_result =
+        synthesizer.wait_for_previous_submission(100);
+    const auto blocked_elapsed = std::chrono::steady_clock::now() - blocked_started;
+    require(
+        blocked_result == HRESULT_FROM_WIN32(ERROR_BUSY) &&
+            pair_ab.fence_value == 0 &&
+            blocked_elapsed >= std::chrono::milliseconds(80),
+        "frame-start gate did not wait for unfinished bridge work");
+
+    require_hresult(
+        gate->Signal(1),
+        "ID3D12Fence::Signal(backpressure release)");
+    fixture.execute_and_wait([](ID3D12GraphicsCommandList*) {});
+    require(
+        operation_succeeded(synthesizer.wait_for_previous_submission(100)),
+        "frame-start gate did not recover after the queue advanced");
+    require(
+        operation_succeeded(synthesizer.submit_pair(
+            capture_b, views, views, 0, 1, &pair_ab)) &&
+            pair_ab.previous_serial == capture_a.serial &&
+            pair_ab.current_serial == capture_b.serial &&
+            pair_ab.fence_value > prime.fence_value,
+        "submission did not recover after backpressure cleared");
+    const HRESULT drain_result = synthesizer.wait_for_idle();
+    require(
+        operation_succeeded(drain_result),
+        "backpressure final drain failed with HRESULT " +
+            std::to_string(static_cast<std::int32_t>(drain_result)));
+    require(
+        operation_succeeded(history->invalidate()),
+        "backpressure history invalidate failed");
+}
+
+void test_nvidia_serialized_eye_context_stress(
+    D3D12WarpFixture& fixture,
+    xrfg::D3D12NvidiaOpticalFlowOptions nvidia_options) {
+    constexpr UINT width = 1024;
+    constexpr UINT height = 512;
+    constexpr std::uint32_t pair_count = 1000;
+    std::array<ComPtr<ID3D12Resource>, 3> sources{
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+    };
+    std::array<ComPtr<ID3D12Resource>, 3> current_destinations{
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+    };
+    std::array<ComPtr<ID3D12Resource>, 3> synthetic_destinations{
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+        create_source_texture(fixture, width, height),
+    };
+    std::array<ID3D12Resource*, 3> source_pointers{
+        sources[0].Get(), sources[1].Get(), sources[2].Get()};
+    std::array<ID3D12Resource*, 3> current_pointers{
+        current_destinations[0].Get(), current_destinations[1].Get(),
+        current_destinations[2].Get()};
+    std::array<ID3D12Resource*, 3> synthetic_pointers{
+        synthetic_destinations[0].Get(), synthetic_destinations[1].Get(),
+        synthetic_destinations[2].Get()};
+    for (UINT index = 0; index < sources.size(); ++index) {
+        upload_pattern(
+            fixture,
+            sources[index].Get(),
+            translated_motion_pattern(
+                width,
+                height,
+                {static_cast<int>(index * 16),
+                 -static_cast<int>(index * 16)}));
+    }
+
+    auto history = std::make_shared<xrfg::D3D12SwapchainHistory>();
+    require(
+        operation_succeeded(history->initialize(
+            fixture.device(), fixture.queue(), source_pointers,
+            D3D12_RESOURCE_STATE_RENDER_TARGET)),
+        "NVIDIA context stress history initialization failed");
+    xrfg::D3D12FrameSynthesizer synthesizer;
+    require(
+        operation_succeeded(synthesizer.initialize(
+            fixture.device(), fixture.queue(), history, current_pointers,
+            synthetic_pointers, kFormat,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            xrfg::D3D12OpticalFlowBackend::nvidia, nvidia_options)),
+        "NVIDIA context stress synthesizer initialization failed");
+
+    const ReprojectionViews views = make_reprojection_views();
+    xrfg::D3D12HistoryCaptureTicket first{};
+    require(
+        operation_succeeded(history->capture(0, &first)) &&
+            operation_succeeded(history->commit(first)),
+        "NVIDIA context stress prime capture failed");
+    xrfg::D3D12FrameSynthesisTicket prime{};
+    require(
+        operation_succeeded(
+            synthesizer.submit_prime(first, views, 0, &prime)),
+        "NVIDIA context stress prime failed");
+
+    const auto started = std::chrono::steady_clock::now();
+    for (std::uint32_t pair = 1; pair <= pair_count; ++pair) {
+        const std::uint32_t index = static_cast<std::uint32_t>(
+            pair % sources.size());
+        xrfg::D3D12HistoryCaptureTicket capture{};
+        HRESULT capture_result = E_FAIL;
+        const auto capture_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            capture_result = history->capture(index, &capture);
+            if (capture_result == HRESULT_FROM_WIN32(ERROR_BUSY)) {
+                Sleep(0);
+            }
+        } while (capture_result == HRESULT_FROM_WIN32(ERROR_BUSY) &&
+                 std::chrono::steady_clock::now() < capture_deadline);
+        require(
+            operation_succeeded(capture_result) &&
+                operation_succeeded(history->commit(capture)),
+            "NVIDIA context stress capture failed at pair " +
+                std::to_string(pair) + " HRESULT " +
+                std::to_string(static_cast<std::int32_t>(capture_result)));
+        xrfg::D3D12FrameSynthesisTicket output{};
+        HRESULT submit_result = E_FAIL;
+        const auto submit_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            submit_result = synthesizer.submit_pair(
+                capture, views, views, index, index, &output);
+            if (submit_result == HRESULT_FROM_WIN32(ERROR_BUSY)) {
+                Sleep(0);
+            }
+        } while (submit_result == HRESULT_FROM_WIN32(ERROR_BUSY) &&
+                 std::chrono::steady_clock::now() < submit_deadline);
+        require(
+            operation_succeeded(submit_result),
+            "NVIDIA context stress submit failed at pair " +
+                std::to_string(pair) + " HRESULT " +
+                std::to_string(static_cast<std::int32_t>(submit_result)) +
+                " serial " + std::to_string(capture.serial) + " slot " +
+                std::to_string(capture.slot));
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    require(
+        operation_succeeded(synthesizer.wait_for_idle()) &&
+            operation_succeeded(history->invalidate()),
+        "NVIDIA context stress retirement failed");
+    fixture.require_no_debug_errors();
+    std::cout << "NVIDIA serialized eye-context stress passed "
+              << pair_count << " pairs in " << elapsed.count() << " ms\n";
+}
+
 #include "nvidia_fast_patterns.inc"
 
 }  // namespace
 
 int main() {
+    const bool trace_test = std::getenv("XRFG_TEST_GPU_TRACE") != nullptr;
+    const auto trace_dir = std::filesystem::temp_directory_path() /
+        ("xrfg-v073-gpu-" + std::to_string(GetCurrentProcessId()));
+    if (trace_test) {
+        std::filesystem::create_directories(trace_dir);
+        std::ofstream(trace_dir / "ofxr_bridge.ini") <<
+            "[diagnostics]\nlogging_enabled=1\nmax_file_mb=32\nflush_each_event=0\n";
+        xrfg::bridge_flight_logger().initialize(trace_dir);
+    }
     try {
         if (GetEnvironmentVariableA("XRFG_TEST_NVIDIA_QUALITY", nullptr, 0)) {
             run_nvidia_fast_controls();
@@ -2883,7 +3832,13 @@ int main() {
         test_rolling_frame_synthesizer(fixture);
         test_double_wide_single_slice_views(fixture);
         test_stereo_motion_synthesis_beats_same_pixel_blend(fixture);
+        test_dlss_motion_vector_stereo_stream_pairing(fixture);
+        test_dlss_motion_vector_gpu_ingress(fixture);
+        test_dlss_motion_vector_strafe_rejects_double_edges(fixture);
         test_rotation_aware_synthesis_beats_uncompensated_flow(fixture);
+        test_submission_backpressure_and_recovery(
+            fixture,
+            xrfg::D3D12OpticalFlowBackend::fidelity_fx);
         fixture.require_no_debug_errors();
         std::array<char, 8> nvidia_test{};
         const DWORD nvidia_test_length = GetEnvironmentVariableA(
@@ -2944,6 +3899,19 @@ int main() {
                 nvidia_fixture,
                 xrfg::D3D12OpticalFlowBackend::nvidia,
                 nvidia_options);
+            test_dlss_motion_vector_gpu_ingress(
+                nvidia_fixture,
+                xrfg::D3D12OpticalFlowBackend::nvidia);
+            test_submission_backpressure_and_recovery(
+                nvidia_fixture,
+                xrfg::D3D12OpticalFlowBackend::nvidia,
+                nvidia_options);
+            if (GetEnvironmentVariableA(
+                    "XRFG_TEST_NVIDIA_CONTEXT_STRESS", nullptr, 0)) {
+                test_nvidia_serialized_eye_context_stress(
+                    nvidia_fixture,
+                    nvidia_options);
+            }
             nvidia_fixture.require_no_debug_errors();
             std::cout << "D3D12 NVIDIA OFA synthesis test passed\n";
         }
@@ -2977,6 +3945,19 @@ int main() {
             std::cout << "D3D12 hardware repeated-capture test passed\n";
         }
         std::cout << "D3D12 WARP asynchronous history/synthesis tests passed\n";
+        if (trace_test) {
+            const auto path = xrfg::bridge_flight_logger().log_path();
+            std::ifstream input(path);
+            const std::string contents{std::istreambuf_iterator<char>(input), {}};
+            require(
+                contents.find(
+                    "op=synthesis_frame_start_wait result=-2147024726") !=
+                    std::string::npos,
+                "transient frame-start synthesis wait breadcrumb missing");
+            xrfg::bridge_flight_logger().shutdown();
+            input.close();
+            std::filesystem::remove_all(trace_dir);
+        }
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "D3D12 WARP asynchronous history/synthesis test failed: "

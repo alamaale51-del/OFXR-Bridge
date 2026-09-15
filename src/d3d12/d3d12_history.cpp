@@ -1,10 +1,12 @@
 #include "xrfg/d3d12_history.hpp"
+#include "xrfg/bridge_flight_logger.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <utility>
@@ -14,6 +16,13 @@ namespace xrfg {
 namespace {
 
 using Microsoft::WRL::ComPtr;
+
+void dred_marker(ID3D12GraphicsCommandList* command_list, const char* label) noexcept {
+    if (command_list != nullptr && label != nullptr &&
+        bridge_flight_logger().enabled()) {
+        command_list->SetMarker(1U, label, static_cast<UINT>(std::strlen(label)));
+    }
+}
 
 [[nodiscard]] bool matching_description(
     const D3D12_RESOURCE_DESC& left,
@@ -166,6 +175,9 @@ struct D3D12SwapchainHistory::Impl {
             }
             return result;
         }
+        // DRED reports this stable name if a device removal stops inside the bridge's
+        // history copy, distinguishing it from game, NGX and synthesis work.
+        slot.capture_list->SetName(L"OFXR History Capture");
         result = slot.capture_list->Close();
         if (FAILED(result) && failure_stage != nullptr) {
             *failure_stage =
@@ -417,6 +429,8 @@ struct D3D12SwapchainHistory::Impl {
             return result;
         }
 
+        dred_marker(slot.capture_list.Get(), "OFXR history begin");
+
         ID3D12Resource* const source = source_images[source_index].Get();
         const std::array<D3D12_RESOURCE_BARRIER, 2> before_copy{
             transition_barrier(source, release_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -428,6 +442,7 @@ struct D3D12SwapchainHistory::Impl {
         slot.capture_list->ResourceBarrier(
             static_cast<UINT>(before_copy.size()),
             before_copy.data());
+        dred_marker(slot.capture_list.Get(), "OFXR history copy");
         slot.capture_list->CopyResource(slot.resource.Get(), source);
 
         const std::array<D3D12_RESOURCE_BARRIER, 2> after_copy{
@@ -440,6 +455,7 @@ struct D3D12SwapchainHistory::Impl {
         slot.capture_list->ResourceBarrier(
             static_cast<UINT>(after_copy.size()),
             after_copy.data());
+        dred_marker(slot.capture_list.Get(), "OFXR history complete");
 
         result = slot.capture_list->Close();
         if (FAILED(result)) {

@@ -78,6 +78,9 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
         return "nvidia_gpu_total";
     case BridgeFlightOperation::presenter_pace:
         return "presenter_pace";
+    case BridgeFlightOperation::synthesis_frame_start_wait:
+        return "synthesis_frame_start_wait";
+    case BridgeFlightOperation::embedded_configuration: return "embedded_configuration";
     }
     return "unknown";
 }

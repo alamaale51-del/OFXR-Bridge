@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(XRFrameGenerationBridge VERSION 0.71.0 LANGUAGES CXX)
+project(XRFrameGenerationBridge VERSION 0.116.0 LANGUAGES CXX)
+
+if(MSVC)
+    # API layers are injected into hosts that can preload an older game-local
+    # MSVCP140.dll. Initialize mutex/CV storage through that loaded runtime
+    # instead of relying on the newer toolset's constexpr representation.
+    add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+endif()
 
 option(XRFG_BUILD_LAYER "Build the Windows OpenXR API layer" ON)
 option(XRFG_BUILD_TESTS "Build the core test executable" ON)
@@ -105,6 +112,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     set(XRFG_PACK_INPUT_HEADER "${XRFG_GENERATED_SHADER_DIR}/pack_flow_input_shader.hpp")
     set(XRFG_FULLSCREEN_VERTEX_HEADER "${XRFG_GENERATED_SHADER_DIR}/fullscreen_vertex_shader.hpp")
     set(XRFG_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/synthesize_midpoint_pixel_shader.hpp")
+    set(XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/game_motion_synthesize_midpoint_pixel_shader.hpp")
     set(XRFG_NVIDIA_PACK_INPUT_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_pack_flow_input_shader.hpp")
     set(XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_synthesize_midpoint_pixel_shader.hpp")
     set(XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_bidirectional_synthesize_midpoint_pixel_shader.hpp")
@@ -115,6 +123,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             "${XRFG_PACK_INPUT_HEADER}"
             "${XRFG_FULLSCREEN_VERTEX_HEADER}"
             "${XRFG_SYNTHESIZE_PIXEL_HEADER}"
+            "${XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_NVIDIA_PACK_INPUT_HEADER}"
             "${XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}"
@@ -132,6 +141,10 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeMidpointPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_synthesize_midpoint_pixel_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeGameMotionMidpointPS
+            /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+            /Fh "${XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_game_motion_synthesize_midpoint_pixel_shader
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E PackNvidiaFlowInput
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
@@ -153,14 +166,17 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_FAST_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_nvidia_fast_bidirectional_synthesize_midpoint_pixel_shader
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+        DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
         VERBATIM)
 
     add_library(xrfg_d3d12_history STATIC
         src/d3d11/d3d11_d3d12_interop.cpp
         src/d3d12/d3d12_history.cpp
         src/d3d12/d3d12_frame_synthesizer.cpp
+        src/common/dlss_motion_vectors.cpp
         "${XRFG_PACK_INPUT_HEADER}"
+        "${XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER}"
         "${XRFG_FULLSCREEN_VERTEX_HEADER}"
         "${XRFG_SYNTHESIZE_PIXEL_HEADER}"
         "${XRFG_NVIDIA_PACK_INPUT_HEADER}"
@@ -194,6 +210,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         src/layer/bridge_flight_logger.cpp
         include/xrfg/bridge_flight_logger.hpp)
     target_include_directories(xrfg_bridge_flight_logger PUBLIC include)
+    target_link_libraries(xrfg_d3d12_history PUBLIC xrfg_bridge_flight_logger)
     target_compile_features(xrfg_bridge_flight_logger PUBLIC cxx_std_20)
     target_compile_definitions(xrfg_bridge_flight_logger PRIVATE
         NOMINMAX
@@ -237,7 +254,9 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     endif()
 
     add_library(XR_APILAYER_XRFrameBridge_diagnostic SHARED
-        src/layer/openxr_layer.cpp)
+        src/common/embedded_control.cpp
+        src/layer/openxr_layer.cpp
+        src/layer/provider_api.cpp)
     target_include_directories(XR_APILAYER_XRFrameBridge_diagnostic PRIVATE
         include
         "${XRFG_OPENXR_SDK_ROOT}/include")
@@ -246,14 +265,16 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         xrfg_d3d12_history
         xrfg_bridge_flight_logger
         xrfg_fps_overlay
-        xrfg_implicit_layer)
+        xrfg_implicit_layer
+        psapi)
     target_compile_features(XR_APILAYER_XRFrameBridge_diagnostic PRIVATE cxx_std_20)
     target_compile_definitions(XR_APILAYER_XRFrameBridge_diagnostic PRIVATE
         NOMINMAX
         WIN32_LEAN_AND_MEAN
         XR_USE_GRAPHICS_API_D3D11
         XR_USE_GRAPHICS_API_D3D12
-        XR_USE_PLATFORM_WIN32)
+        XR_USE_PLATFORM_WIN32
+        OFXR_PROVIDER_API_EXPORTS)
     if(MSVC)
         target_compile_options(XR_APILAYER_XRFrameBridge_diagnostic PRIVATE
             /W4 /permissive- /EHsc)
@@ -332,6 +353,16 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             endif()
             add_test(NAME xrfg_standalone_launcher_tests
                 COMMAND xrfg_standalone_launcher_tests)
+            add_executable(xrfg_tray_lifecycle_tests tests/tray_lifecycle_tests.cpp)
+            target_link_libraries(xrfg_tray_lifecycle_tests PRIVATE
+                xrfg_standalone_core comctl32 ole32 shell32 user32)
+            target_compile_definitions(xrfg_tray_lifecycle_tests PRIVATE
+                XRFG_IMPLEMENTATION_VERSION=${PROJECT_VERSION_MINOR}
+                NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+            if(MSVC)
+                target_compile_options(xrfg_tray_lifecycle_tests PRIVATE /W4 /permissive- /EHsc)
+            endif()
+            add_test(NAME xrfg_tray_lifecycle_tests COMMAND xrfg_tray_lifecycle_tests)
         endif()
     endif()
 
@@ -363,6 +394,51 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             NAME xrfg_layer_negotiation
             COMMAND xrfg_layer_smoke $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>)
 
+        add_library(xrfg_optiscaler_bootstrap_stub SHARED
+            tests/optiscaler_bootstrap_stub.cpp)
+        target_include_directories(xrfg_optiscaler_bootstrap_stub PRIVATE
+            include
+            "${XRFG_OPENXR_SDK_ROOT}/include")
+        target_compile_features(xrfg_optiscaler_bootstrap_stub PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(xrfg_optiscaler_bootstrap_stub PRIVATE
+                /W4 /permissive- /EHsc)
+            target_compile_definitions(xrfg_optiscaler_bootstrap_stub PRIVATE
+                NOMINMAX WIN32_LEAN_AND_MEAN)
+        endif()
+
+        add_executable(xrfg_optiscaler_bootstrap_tests
+            tests/optiscaler_bootstrap_tests.cpp)
+        target_include_directories(xrfg_optiscaler_bootstrap_tests PRIVATE
+            "${XRFG_OPENXR_SDK_ROOT}/include")
+        target_compile_features(xrfg_optiscaler_bootstrap_tests PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(xrfg_optiscaler_bootstrap_tests PRIVATE
+                /W4 /permissive- /EHsc)
+            target_compile_definitions(xrfg_optiscaler_bootstrap_tests PRIVATE
+                NOMINMAX WIN32_LEAN_AND_MEAN)
+        endif()
+        foreach(mode success incompatible failure seh)
+            add_test(
+                NAME xrfg_optiscaler_bootstrap_${mode}
+                COMMAND xrfg_optiscaler_bootstrap_tests
+                    $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>
+                    $<TARGET_FILE:xrfg_optiscaler_bootstrap_stub>
+                    ${mode})
+        endforeach()
+
+        add_executable(xrfg_provider_api_tests tests/provider_api_tests.cpp)
+        target_include_directories(xrfg_provider_api_tests PRIVATE include)
+        target_compile_features(xrfg_provider_api_tests PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(xrfg_provider_api_tests PRIVATE /W4 /permissive- /EHsc)
+            target_compile_definitions(xrfg_provider_api_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        endif()
+        add_dependencies(xrfg_provider_api_tests XR_APILAYER_XRFrameBridge_diagnostic)
+        add_test(
+            NAME xrfg_provider_api
+            COMMAND xrfg_provider_api_tests $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>)
+
         add_executable(xrfg_layer_call_chain tests/layer_call_chain.cpp)
         target_include_directories(xrfg_layer_call_chain PRIVATE
             "${XRFG_OPENXR_SDK_ROOT}/include")
@@ -377,7 +453,31 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 XR_USE_PLATFORM_WIN32)
         endif()
         target_link_libraries(xrfg_layer_call_chain PRIVATE d3d11 d3d12 dxgi)
+        foreach(mode inverted-fov d3d11-inverted-fov)
+            add_test(NAME xrfg_layer_${mode} COMMAND xrfg_layer_call_chain
+                $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>
+                "${CMAKE_CURRENT_BINARY_DIR}/xrfg-${mode}.log" ${mode})
+        endforeach()
         add_dependencies(xrfg_layer_call_chain XR_APILAYER_XRFrameBridge_diagnostic)
+        add_executable(xrfg_layer_manual_disarm_tests tests/layer_manual_disarm_tests.cpp)
+        target_include_directories(xrfg_layer_manual_disarm_tests PRIVATE "${XRFG_OPENXR_SDK_ROOT}/include")
+        target_link_libraries(xrfg_layer_manual_disarm_tests PRIVATE xrfg_implicit_layer d3d11 d3d12 dxgi)
+        target_compile_definitions(xrfg_layer_manual_disarm_tests PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN XR_USE_GRAPHICS_API_D3D11 XR_USE_GRAPHICS_API_D3D12 XR_USE_PLATFORM_WIN32)
+        if(MSVC)
+            target_compile_options(xrfg_layer_manual_disarm_tests PRIVATE /W4 /permissive- /EHsc)
+        endif()
+        add_dependencies(xrfg_layer_manual_disarm_tests XR_APILAYER_XRFrameBridge_diagnostic)
+        foreach(mode inline d3d11 steamvr flight)
+            add_test(NAME xrfg_manual_disarm_${mode} COMMAND xrfg_layer_manual_disarm_tests
+                $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic> ${mode})
+            set_tests_properties(xrfg_manual_disarm_${mode} PROPERTIES TIMEOUT 30)
+        endforeach()
+        foreach(marker on off hidden)
+            add_test(NAME xrfg_layer_marker_d3d11_${marker} COMMAND xrfg_layer_manual_disarm_tests
+                $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic> d3d11 ${marker})
+            set_tests_properties(xrfg_layer_marker_d3d11_${marker} PROPERTIES TIMEOUT 30)
+        endforeach()
         add_test(
             NAME xrfg_layer_call_chain
             COMMAND xrfg_layer_call_chain
@@ -416,6 +516,13 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>
                 "${CMAKE_CURRENT_BINARY_DIR}/xrfg-layer-double-wide-call-chain-test.log"
                 double-wide)
+
+        add_test(
+            NAME xrfg_layer_uevr_pipelined_display_time
+            COMMAND xrfg_layer_call_chain
+                $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>
+                "${CMAKE_CURRENT_BINARY_DIR}/xrfg-layer-uevr-pipelined-display-time-test.log"
+                uevr-pipelined-time)
 
         add_test(
             NAME xrfg_layer_d3d11_interop
@@ -485,6 +592,25 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 WIN32_LEAN_AND_MEAN)
         endif()
         add_test(NAME xrfg_d3d12_history_tests COMMAND xrfg_d3d12_history_tests)
+
+        add_executable(xrfg_vertical_fov_tests tests/vertical_fov_tests.cpp)
+        target_include_directories(xrfg_vertical_fov_tests PRIVATE include)
+        target_link_libraries(xrfg_vertical_fov_tests PRIVATE xrfg_d3d12_history d3d12 dxgi)
+        target_compile_features(xrfg_vertical_fov_tests PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(xrfg_vertical_fov_tests PRIVATE /W4 /permissive- /EHsc)
+            target_compile_definitions(xrfg_vertical_fov_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        endif()
+        add_test(NAME xrfg_vertical_fov_tests COMMAND xrfg_vertical_fov_tests)
+        add_executable(xrfg_synthetic_marker_tests tests/synthetic_marker_tests.cpp)
+        target_include_directories(xrfg_synthetic_marker_tests PRIVATE include)
+        target_link_libraries(xrfg_synthetic_marker_tests PRIVATE xrfg_d3d12_history d3d12 dxgi)
+        target_compile_features(xrfg_synthetic_marker_tests PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(xrfg_synthetic_marker_tests PRIVATE /W4 /permissive- /EHsc)
+            target_compile_definitions(xrfg_synthetic_marker_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        endif()
+        add_test(NAME xrfg_synthetic_marker_tests COMMAND xrfg_synthetic_marker_tests)
 
         add_executable(xrfg_nvidia_optical_flow_probe
             tests/nvidia_optical_flow_probe.cpp)
