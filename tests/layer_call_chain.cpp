@@ -61,7 +61,9 @@ XrTime g_next_display_time = 100;
 bool g_split_eye_mode = false;
 bool g_cropped_subimage_mode = false;
 bool g_double_wide_mode = false;
+bool g_uevr_pipelined_display_time_mode = false;
 bool g_d3d11_interop_mode = false;
+bool g_inverted_vertical_fov = false;
 bool g_steamvr_runtime_mode = false;
 bool g_steamvr_presenter_mode = false;
 bool g_flight_simulator_mode = false;
@@ -202,6 +204,7 @@ std::array<ComPtr<ID3D12Resource>, 3> g_synthetic_swapchain_right_images;
     view.fov.angleRight = 0.8F + sample * 0.012F + static_cast<float>(index) * 0.001F;
     view.fov.angleUp = 0.7F + sample * 0.008F;
     view.fov.angleDown = -0.7F - sample * 0.006F;
+    if (g_inverted_vertical_fov) std::swap(view.fov.angleUp, view.fov.angleDown);
     return view;
 }
 
@@ -350,6 +353,7 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_end_frame(
         std::scoped_lock lock(g_frame_loop_mutex);
         if (!g_begun_display_time || end_info == nullptr ||
             (!g_flight_simulator_mode &&
+             !g_uevr_pipelined_display_time_mode &&
              end_info->displayTime != *g_begun_display_time)) {
             return XR_ERROR_CALL_ORDER_INVALID;
         }
@@ -1008,7 +1012,8 @@ int main(int argc, char** argv) {
             "usage: xrfg_layer_call_chain <layer-dll> <log-path> "
             "[split-eye|cropped-split-eye|double-wide|d3d11-interop|"
             "d3d11-double-wide|steamvr-inline|steamvr-presenter|"
-            "flight-simulator]\n";
+            "flight-simulator|uevr-pipelined-time|inverted-fov|"
+            "d3d11-inverted-fov]\n";
         return EXIT_FAILURE;
     }
     g_cropped_subimage_mode =
@@ -1026,17 +1031,24 @@ int main(int argc, char** argv) {
     g_flight_simulator_mode = g_destroy_pending_swapchain ||
         (argc == 4 && std::strcmp(argv[3], "flight-simulator") == 0);
     g_test_application_thread_id = GetCurrentThreadId();
+    g_inverted_vertical_fov = argc == 4 &&
+        (std::strcmp(argv[3], "inverted-fov") == 0 ||
+         std::strcmp(argv[3], "d3d11-inverted-fov") == 0);
     g_d3d11_interop_mode = argc == 4 &&
         (std::strcmp(argv[3], "d3d11-interop") == 0 ||
+         std::strcmp(argv[3], "d3d11-inverted-fov") == 0 ||
          d3d11_double_wide_mode);
+    g_uevr_pipelined_display_time_mode =
+        argc == 4 && std::strcmp(argv[3], "uevr-pipelined-time") == 0;
     g_double_wide_mode = argc == 4 &&
         (std::strcmp(argv[3], "double-wide") == 0 ||
-         d3d11_double_wide_mode);
+         d3d11_double_wide_mode || g_uevr_pipelined_display_time_mode);
     g_split_eye_mode = argc == 4 &&
         (std::strcmp(argv[3], "split-eye") == 0 || g_cropped_subimage_mode);
     if (argc == 4 && !g_split_eye_mode && !g_double_wide_mode &&
         !g_d3d11_interop_mode && !g_steamvr_runtime_mode &&
-        !g_flight_simulator_mode) {
+        !g_flight_simulator_mode && !g_uevr_pipelined_display_time_mode &&
+        !g_inverted_vertical_fov) {
         std::cerr << "unknown test mode\n";
         return EXIT_FAILURE;
     }
@@ -1657,6 +1669,56 @@ int main(int argc, char** argv) {
                XR_SUCCEEDED(wait_image(swapchain, &image_wait_info)) &&
                XR_SUCCEEDED(release_image(swapchain, &release_info));
     };
+
+    if (g_uevr_pipelined_display_time_mode) {
+        XrFrameState uevr_frame_a{XR_TYPE_FRAME_STATE};
+        XrFrameState uevr_frame_b{XR_TYPE_FRAME_STATE};
+        const bool frame_sequence_succeeded =
+            XR_SUCCEEDED(wait_frame(session, &frame_wait_info, &uevr_frame_a)) &&
+            uevr_frame_a.predictedDisplayTime == 100 &&
+            XR_SUCCEEDED(begin_frame(session, &frame_begin_info)) &&
+            capture_fresh_application_image() &&
+            submit_frame(uevr_frame_a.predictedDisplayTime - 10) &&
+            XR_SUCCEEDED(wait_frame(session, &frame_wait_info, &uevr_frame_b)) &&
+            uevr_frame_b.predictedDisplayTime == 200 &&
+            XR_SUCCEEDED(begin_frame(session, &frame_begin_info)) &&
+            capture_fresh_application_image() &&
+            submit_frame(uevr_frame_b.predictedDisplayTime - 10) &&
+            wait_for_queue_idle();
+
+        const bool teardown_succeeded =
+            XR_SUCCEEDED(end_session(session)) &&
+            XR_SUCCEEDED(destroy_swapchain(swapchain)) &&
+            XR_SUCCEEDED(destroy_session(session)) &&
+            XR_SUCCEEDED(destroy_instance(instance));
+        FreeLibrary(module);
+
+        std::vector<EndFrameRecord> end_records;
+        {
+            std::scoped_lock lock(g_end_records_mutex);
+            end_records = g_end_records;
+        }
+        const bool valid =
+            frame_sequence_succeeded && teardown_succeeded &&
+            end_records.size() == 3 &&
+            end_records[0].display_time == 90 &&
+            end_records[0].target == SubmittedTarget::current &&
+            end_records[1].display_time == 190 &&
+            end_records[1].target == SubmittedTarget::synthetic &&
+            end_records[2].display_time == 300 &&
+            end_records[2].target == SubmittedTarget::current &&
+            g_wait_frame_calls.load(std::memory_order_relaxed) == 3 &&
+            // Includes the harness's earlier exception-containment probe.
+            g_begin_frame_calls.load(std::memory_order_relaxed) == 4 &&
+            g_end_frame_calls.load(std::memory_order_relaxed) == 3 &&
+            g_waited_display_times.empty() && !g_begun_display_time;
+        if (!valid) {
+            return EXIT_FAILURE;
+        }
+        std::cout <<
+            "OpenXR UEVR pipelined display-time call-chain test passed\n";
+        return EXIT_SUCCESS;
+    }
 
     if (g_flight_simulator_mode) {
         std::array<XrFrameState, 4> application_frames{{

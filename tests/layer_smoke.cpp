@@ -7,9 +7,18 @@
 #include <iostream>
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::cerr << "usage: xrfg_layer_smoke <layer-dll>\n";
+    if (argc != 2 && argc != 3) {
+        std::cerr << "usage: xrfg_layer_smoke <layer-dll> [delegated-layer-dll]\n";
         return EXIT_FAILURE;
+    }
+
+    HMODULE delegated_module = nullptr;
+    if (argc == 3) {
+        delegated_module = LoadLibraryA(argv[2]);
+        if (delegated_module == nullptr) {
+            std::cerr << "delegated LoadLibrary failed: " << GetLastError() << '\n';
+            return EXIT_FAILURE;
+        }
     }
 
     const HMODULE module = LoadLibraryA(argv[1]);
@@ -23,6 +32,7 @@ int main(int argc, char** argv) {
     if (negotiate == nullptr) {
         std::cerr << "negotiation export is missing\n";
         FreeLibrary(module);
+        if (delegated_module != nullptr) FreeLibrary(delegated_module);
         return EXIT_FAILURE;
     }
 
@@ -49,10 +59,27 @@ int main(int argc, char** argv) {
         XR_VERSION_MAJOR(request.layerApiVersion) != 1) {
         std::cerr << "layer negotiation failed: " << result << '\n';
         FreeLibrary(module);
+        if (delegated_module != nullptr) FreeLibrary(delegated_module);
         return EXIT_FAILURE;
     }
 
+    if (delegated_module != nullptr) {
+        HMODULE owner = nullptr;
+        if (!GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(request.createApiLayerInstance),
+                &owner) ||
+            owner != delegated_module) {
+            std::cerr << "layer negotiation did not delegate to the requested module\n";
+            FreeLibrary(module);
+            FreeLibrary(delegated_module);
+            return EXIT_FAILURE;
+        }
+    }
+
     FreeLibrary(module);
+    if (delegated_module != nullptr) FreeLibrary(delegated_module);
     std::cout << "OpenXR layer export and negotiation smoke test passed\n";
     return EXIT_SUCCESS;
 }
