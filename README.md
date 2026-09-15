@@ -3,13 +3,8 @@
 OFXR Bridge is an experimental OpenXR API layer that inserts an optical-flow
 generated frame between two rendered frames.
 
-Current pre-release: **v0.2.0 (internal build V068)**.
-See the [release notes](docs/releases/0.2.0.md).
-
-V068 integrates [PR #3](https://github.com/tig3rmast3r/OFXR-Bridge/pull/3):
-presenter pacing, D3D11 context protection and optional OpenXR frame-info
-validation, plus resource-lifetime fixes found during integration. See the
-[integration notes](docs/PR3_INTEGRATION.md) for validation and remaining limits.
+Current pre-release: **v0.2.1 (internal build V116)**.
+See the [release notes](docs/releases/0.2.1.md).
 
 > [!WARNING]
 > This is a pre-release. It may not work with your game, VR mod, GPU or OpenXR
@@ -69,15 +64,9 @@ The bridge's own optional FPS number counts accepted nonempty OpenXR
 submissions. It is a diagnostic indicator rather than proof of physical headset
 scanout; see [FPS overlay details](docs/FPS_OVERLAY.md).
 
-Run the game without administrator privileges. The OpenXR loader ignores
-per-user layer registrations for elevated games; running the tray as
-administrator does not change this. OFXR Bridge does not replace your active
-OpenXR runtime.
-
 The tray and bridge require the [Microsoft Visual C++ Redistributable
 x64](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
-Windows 10 reports where OFXR never loads and creates no log are still under
-investigation; this release does not include a confirmed fix for those reports.
+OFXR Bridge does not replace your active OpenXR runtime.
 
 FidelityFX is the most performing one but will produce artifacts during headset rotation in dark areas, this is known and cannot be avoided.
 
