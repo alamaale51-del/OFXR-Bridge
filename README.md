@@ -64,6 +64,14 @@ The bridge's own optional FPS number counts accepted nonempty OpenXR
 submissions. It is a diagnostic indicator rather than proof of physical headset
 scanout; see [FPS overlay details](docs/FPS_OVERLAY.md).
 
+When both the **Bridge flight recorder** and an FPS overlay position are
+enabled, OFXR draws a small purple rectangle into synthetic frames near the FPS
+counter. Its purpose is to verify whether generated frames are actually
+reaching the headset: if the rectangle is visible there, the synthetic output
+has reached the displayed presentation path. The green FPS number alone only
+confirms accepted submissions. Disable the flight recorder after testing to
+remove the marker.
+
 The tray and bridge require the [Microsoft Visual C++ Redistributable
 x64](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
 OFXR Bridge does not replace your active OpenXR runtime.
@@ -90,6 +98,9 @@ inert and may be deleted manually at any time.
 Please report both working and non-working games, rendering problems, freezes
 and crashes in [GitHub Issues](https://github.com/tig3rmast3r/OFXR-Bridge/issues)
 or on the [Flat2VR Modding Discord](https://discord.gg/flat2vr).
+
+Reported results are collected in the
+[OFXR Bridge Compatibility Chart](https://docs.google.com/spreadsheets/d/1lhaJm1wzt29exmx4tZbxdwf82RcrlLcyZJ850GcTf1w/edit?usp=sharing).
 
 Before reproducing a problem:
 
