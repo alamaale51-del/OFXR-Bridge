@@ -8,6 +8,7 @@
 #include <shlobj.h>
 
 #include <array>
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -64,6 +65,11 @@ struct AppState {
     std::filesystem::path local_directory;
     std::filesystem::path settings_path;
     std::filesystem::path armed_manifest;
+    xrfg::implicit_layer::RegistryScope armed_scope{
+        xrfg::implicit_layer::RegistryScope::current_user};
+    HANDLE arm_signal{};
+    // Alternate namespace used by lifecycle tests, never read from user INI.
+    std::wstring registry_subkey{xrfg::implicit_layer::kRegistrySubkey};
     HICON armed_icon{};
     HICON disarmed_icon{};
     UINT taskbar_created_message{};
@@ -178,35 +184,45 @@ void remove_manifest_file(const std::filesystem::path& manifest) {
     std::filesystem::remove(manifest, ignored);
 }
 
-void cleanup_stale_manifests(const std::filesystem::path& local_directory) {
-    const auto directory = runtime_directory(local_directory);
-    std::error_code iterator_error;
-    for (std::filesystem::directory_iterator iterator(directory, iterator_error), end;
-         !iterator_error && iterator != end;
-         iterator.increment(iterator_error)) {
-        if (!iterator->is_regular_file(iterator_error)) {
-            continue;
-        }
-        const auto manifest = iterator->path();
-        if (!xrfg::implicit_layer::owned_manifest_path(manifest, directory)) {
-            continue;
-        }
-        static_cast<void>(xrfg::implicit_layer::unregister_manifest(manifest));
-        remove_manifest_file(manifest);
-    }
+void log_lifecycle(const std::filesystem::path& local_directory,
+                   std::wstring_view action, std::wstring_view error = {}) noexcept {
+    try {
+        std::filesystem::create_directories(local_directory);
+        const auto path = local_directory / L"tray-lifecycle.log";
+        std::error_code size_error;
+        const auto size = std::filesystem::file_size(path, size_error);
+        std::wofstream stream(path, !size_error && size > 262144
+            ? std::ios::trunc : std::ios::app);
+        SYSTEMTIME time{};
+        GetLocalTime(&time);
+        stream << time.wYear << L'-' << time.wMonth << L'-' << time.wDay << L' '
+               << time.wHour << L':' << time.wMinute << L':' << time.wSecond
+               << L" pid=" << GetCurrentProcessId() << L" V" << kImplementationVersion
+               << L' ' << action << (error.empty() ? L" OK" : L" FAILED: ") << error << L'\n';
+    } catch (...) { /* Cleanup must not depend on diagnostic I/O. */ }
 }
 
 [[nodiscard]] bool write_runtime_configuration(
     const AppState& state,
-    std::wstring* error) {
+    std::wstring* error,
+    const std::filesystem::path& arm_manifest = {}) {
+    const auto& manifest = arm_manifest.empty() ? state.armed_manifest : arm_manifest;
+    std::string configuration = xrfg::standalone::build_runtime_ini(state.settings);
+    if (!manifest.empty()) {
+        const auto control = xrfg::implicit_layer::arm_signal_name(manifest);
+        std::string ascii_control;
+        for (const wchar_t c : control) ascii_control.push_back(static_cast<char>(c));
+        configuration.insert(std::string("[ofxr]\r\n").size(),
+            "control_event=" + ascii_control + "\r\n");
+    }
     return write_text_atomic(
         runtime_directory(state.local_directory) / L"ofxr_bridge.ini",
-        xrfg::standalone::build_runtime_ini(state.settings),
+        configuration,
         error);
 }
 
 [[nodiscard]] bool prepare_runtime_layer(
-    const AppState& state,
+    AppState& state,
     std::filesystem::path* manifest,
     std::wstring* error) {
     try {
@@ -229,18 +245,23 @@ void cleanup_stale_manifests(const std::filesystem::path& local_directory) {
             return false;
         }
 
+        static std::uint64_t last_arm_id = 0;
+        last_arm_id = std::max<std::uint64_t>(last_arm_id + 1, GetTickCount64());
         const std::wstring manifest_name =
             std::wstring(xrfg::implicit_layer::kManifestPrefix) +
             std::to_wstring(GetCurrentProcessId()) + L"-" +
-            std::to_wstring(GetTickCount64()) +
+            std::to_wstring(last_arm_id) +
             xrfg::implicit_layer::kManifestSuffix;
         const auto generated_manifest = directory / manifest_name;
+        *manifest = generated_manifest;
+        state.arm_signal = xrfg::implicit_layer::create_arm_signal(generated_manifest, error);
+        if (!state.arm_signal) return false;
         if (!write_text_atomic(
                 generated_manifest,
                 xrfg::standalone::build_implicit_layer_manifest(
                     runtime_dll, kImplementationVersion),
                 error) ||
-            !write_runtime_configuration(state, error)) {
+            !write_runtime_configuration(state, error, generated_manifest)) {
             remove_manifest_file(generated_manifest);
             return false;
         }
@@ -255,6 +276,7 @@ void cleanup_stale_manifests(const std::filesystem::path& local_directory) {
 [[nodiscard]] bool spawn_cleanup_helper(
     const AppState& state,
     const std::filesystem::path& manifest,
+    xrfg::implicit_layer::RegistryScope scope,
     std::wstring* error) {
     std::wstring command = xrfg::standalone::quote_windows_argument(
         (state.executable_directory / L"OFXRBridgeTray.exe").wstring());
@@ -264,6 +286,8 @@ void cleanup_stale_manifests(const std::filesystem::path& local_directory) {
     command += xrfg::standalone::quote_windows_argument(manifest.wstring());
     command += L" ";
     command += std::to_wstring(GetCurrentProcessId());
+    command += L" ";
+    command += xrfg::implicit_layer::registry_scope_name(scope);
     std::vector<wchar_t> mutable_command(command.begin(), command.end());
     mutable_command.push_back(L'\0');
 
@@ -289,6 +313,29 @@ void cleanup_stale_manifests(const std::filesystem::path& local_directory) {
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     return true;
+}
+
+[[nodiscard]] bool cleanup_all_owned_registrations(
+    const AppState& state,
+    std::wstring* error) {
+    if (error) error->clear();
+    bool success = true;
+    for (const auto scope : {
+             xrfg::implicit_layer::RegistryScope::current_user,
+             xrfg::implicit_layer::RegistryScope::local_machine}) {
+        std::wstring detail;
+        if (!xrfg::implicit_layer::cleanup_owned_registrations(
+                state.local_directory, scope, &detail, state.registry_subkey)) {
+            success = false;
+            if (error) {
+                if (!error->empty()) *error += L"\r\n";
+                *error += xrfg::implicit_layer::registry_scope_name(scope);
+                *error += L": ";
+                *error += detail;
+            }
+        }
+    }
+    return success;
 }
 
 [[nodiscard]] std::wstring tray_tooltip(const AppState& state) {
@@ -365,48 +412,74 @@ void show_balloon(
 
 [[nodiscard]] bool disarm_bridge(
     AppState& state,
-    std::wstring* error,
-    bool remove_manifest = true) {
-    if (!state.armed) {
-        return true;
+    std::wstring* error) {
+    // Signal the active DLL BEFORE registry/file cleanup or window teardown.
+    std::wstring signal_error;
+    if (state.arm_signal && !SetEvent(state.arm_signal))
+        signal_error = last_error_message(L"Stopping the loaded OFXR layer");
+    std::wstring detail;
+    const bool cleaned = cleanup_all_owned_registrations(state, &detail);
+    if (!signal_error.empty()) {
+        if (!detail.empty()) detail += L"\r\n";
+        detail += signal_error;
     }
-    if (!xrfg::implicit_layer::unregister_manifest(state.armed_manifest, error)) {
+    if (!cleaned || !signal_error.empty()) {
+        log_lifecycle(state.local_directory, L"disarm-all", detail);
+        if (error) *error = detail;
         return false;
     }
-    if (remove_manifest) {
-        remove_manifest_file(state.armed_manifest);
+    log_lifecycle(state.local_directory, L"disarm-all");
+    if (state.arm_signal) {
+        CloseHandle(state.arm_signal);
+        state.arm_signal = nullptr;
     }
     state.armed = false;
     state.armed_manifest.clear();
+    state.armed_scope = xrfg::implicit_layer::RegistryScope::current_user;
     refresh_tray_icon(state);
     return true;
 }
 
 [[nodiscard]] bool arm_bridge(AppState& state, std::wstring* error) {
-    if (state.armed && xrfg::implicit_layer::manifest_registered(
-                           state.armed_manifest)) {
-        return true;
-    }
-    if (state.armed) {
-        std::wstring ignored;
-        static_cast<void>(disarm_bridge(state, &ignored));
-    }
+    // Reconcile disk/registry state, not just this tray process's memory.
+    if (!disarm_bridge(state, error)) return false;
 
     std::filesystem::path manifest;
+    const auto scope = xrfg::implicit_layer::preferred_registry_scope();
     if (!prepare_runtime_layer(state, &manifest, error) ||
-        !xrfg::implicit_layer::register_manifest(manifest, error)) {
-        remove_manifest_file(manifest);
+        !xrfg::implicit_layer::register_manifest(
+            manifest, scope, error, state.registry_subkey)) {
+        if (!manifest.empty()) {
+            std::wstring cleanup_error;
+            if (!xrfg::implicit_layer::retire_manifest(
+                    manifest, scope, &cleanup_error, state.registry_subkey))
+                log_lifecycle(state.local_directory, L"arm-failure-cleanup", cleanup_error);
+        }
+        if (state.arm_signal) {
+            SetEvent(state.arm_signal);
+            CloseHandle(state.arm_signal);
+            state.arm_signal = nullptr;
+        }
         return false;
     }
-    if (!spawn_cleanup_helper(state, manifest, error)) {
+    if (!spawn_cleanup_helper(state, manifest, scope, error)) {
         std::wstring ignored;
-        static_cast<void>(xrfg::implicit_layer::unregister_manifest(
-            manifest, &ignored));
-        remove_manifest_file(manifest);
+        static_cast<void>(xrfg::implicit_layer::retire_manifest(
+            manifest, scope, &ignored, state.registry_subkey));
+        if (state.arm_signal) {
+            SetEvent(state.arm_signal);
+            CloseHandle(state.arm_signal);
+            state.arm_signal = nullptr;
+        }
         return false;
     }
     state.armed = true;
     state.armed_manifest = manifest;
+    state.armed_scope = scope;
+    log_lifecycle(state.local_directory,
+        scope == xrfg::implicit_layer::RegistryScope::local_machine
+            ? L"arm-hklm"
+            : L"arm-hkcu");
     refresh_tray_icon(state);
     show_balloon(
         state,
@@ -703,7 +776,7 @@ void handle_command(AppState& state, UINT command) {
         break;
     }
     case exit_application:
-        DestroyWindow(state.window);
+        SendMessageW(state.window, WM_CLOSE, 0, 0);
         break;
     default:
         break;
@@ -742,14 +815,39 @@ LRESULT CALLBACK window_procedure(
     case WM_COMMAND:
         handle_command(*state, LOWORD(wparam));
         return 0;
+    case WM_CLOSE: {
+        std::wstring error;
+        if (!disarm_bridge(*state, &error)) {
+            show_error(window, error);
+            return 0;
+        }
+        DestroyWindow(window);
+        return 0;
+    }
     case WM_QUERYENDSESSION: {
-        std::wstring ignored;
-        static_cast<void>(disarm_bridge(*state, &ignored));
+        std::wstring error;
+        if (!disarm_bridge(*state, &error)) {
+            ShutdownBlockReasonCreate(window, L"OFXR Bridge could not disable its OpenXR registrations.");
+            return FALSE;
+        }
+        ShutdownBlockReasonDestroy(window);
         return TRUE;
     }
+    case WM_ENDSESSION:
+        if (wparam != FALSE) {
+            std::wstring error;
+            if (!disarm_bridge(*state, &error))
+                log_lifecycle(state->local_directory, L"end-session-cleanup", error);
+            DestroyWindow(window);
+        } else {
+            // A cancelled shutdown remains disarmed; never silently re-arm.
+            ShutdownBlockReasonDestroy(window);
+        }
+        return 0;
     case WM_DESTROY: {
-        std::wstring ignored;
-        static_cast<void>(disarm_bridge(*state, &ignored));
+        std::wstring error;
+        if (!disarm_bridge(*state, &error))
+            log_lifecycle(state->local_directory, L"destroy-cleanup", error);
         Shell_NotifyIconW(NIM_DELETE, &state->icon);
         PostQuitMessage(0);
         return 0;
@@ -757,6 +855,24 @@ LRESULT CALLBACK window_procedure(
     default:
         return DefWindowProcW(window, message, wparam, lparam);
     }
+}
+
+[[nodiscard]] bool watch_registered_arm(
+    HANDLE parent, const std::filesystem::path& manifest,
+    const std::filesystem::path& local_directory, std::wstring* error,
+    xrfg::implicit_layer::RegistryScope scope,
+    std::wstring_view registry_subkey = xrfg::implicit_layer::kRegistrySubkey) {
+    if (!xrfg::implicit_layer::owned_registration_path(manifest, local_directory)) {
+        if (error) *error = L"Cleanup watchdog refused an unowned manifest.";
+        return false;
+    }
+    while (xrfg::implicit_layer::manifest_registered(manifest, scope, registry_subkey)) {
+        if (parent == nullptr || WaitForSingleObject(parent, kArmPollMilliseconds) != WAIT_TIMEOUT)
+            break;
+    }
+    // Scoped to this arm only: an old helper must never revoke a newer arm.
+    return xrfg::implicit_layer::retire_manifest(
+        manifest, scope, error, registry_subkey);
 }
 
 [[nodiscard]] std::optional<int> run_cleanup_helper() {
@@ -769,7 +885,7 @@ LRESULT CALLBACK window_procedure(
         LocalFree(arguments);
         return std::nullopt;
     }
-    if (argument_count != 4) {
+    if (argument_count != 5) {
         LocalFree(arguments);
         return EXIT_FAILURE;
     }
@@ -778,8 +894,14 @@ LRESULT CALLBACK window_procedure(
     const unsigned long parsed_pid = std::wcstoul(arguments[3], &end, 10);
     const bool valid_pid = end != arguments[3] && end != nullptr && *end == L'\0' &&
                            parsed_pid > 0 && parsed_pid <= MAXDWORD;
+    const std::wstring_view scope_argument(arguments[4]);
+    const auto scope = _wcsicmp(scope_argument.data(), L"HKLM") == 0
+        ? xrfg::implicit_layer::RegistryScope::local_machine
+        : xrfg::implicit_layer::RegistryScope::current_user;
+    const bool valid_scope = _wcsicmp(scope_argument.data(), L"HKLM") == 0 ||
+                             _wcsicmp(scope_argument.data(), L"HKCU") == 0;
     LocalFree(arguments);
-    if (!valid_pid) {
+    if (!valid_pid || !valid_scope) {
         return EXIT_FAILURE;
     }
 
@@ -794,18 +916,14 @@ LRESULT CALLBACK window_procedure(
     }
 
     HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(parsed_pid));
-    while (xrfg::implicit_layer::manifest_registered(manifest)) {
-        if (parent == nullptr ||
-            WaitForSingleObject(parent, kArmPollMilliseconds) == WAIT_OBJECT_0) {
-            break;
-        }
-    }
+    std::wstring error;
+    const bool cleaned = watch_registered_arm(parent, manifest,
+        local_app_data() / L"OFXR Bridge", &error, scope);
     if (parent != nullptr) {
         CloseHandle(parent);
     }
-    static_cast<void>(xrfg::implicit_layer::unregister_manifest(manifest));
-    remove_manifest_file(manifest);
-    return EXIT_SUCCESS;
+    log_lifecycle(local_app_data() / L"OFXR Bridge", L"watchdog-cleanup", error);
+    return cleaned ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 } // namespace
@@ -834,7 +952,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         state.executable_directory = executable_directory();
         state.local_directory = local_app_data() / L"OFXR Bridge";
         state.settings_path = state.local_directory / L"tray.ini";
-        cleanup_stale_manifests(state.local_directory);
+        std::wstring cleanup_error;
+        if (!cleanup_all_owned_registrations(state, &cleanup_error)) {
+            log_lifecycle(state.local_directory, L"startup-cleanup", cleanup_error);
+            MessageBoxW(nullptr, cleanup_error.c_str(), kApplicationName, MB_OK | MB_ICONERROR);
+            CloseHandle(single_instance);
+            return EXIT_FAILURE;
+        }
+        log_lifecycle(state.local_directory, L"startup-cleanup");
         load_settings(state);
     } catch (...) {
         MessageBoxW(
@@ -896,6 +1021,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    std::wstring cleanup_error;
+    const bool clean_exit = disarm_bridge(state, &cleanup_error);
+    if (!clean_exit) log_lifecycle(state.local_directory, L"message-loop-exit", cleanup_error);
     CloseHandle(single_instance);
-    return static_cast<int>(message.wParam);
+    return clean_exit ? static_cast<int>(message.wParam) : EXIT_FAILURE;
 }

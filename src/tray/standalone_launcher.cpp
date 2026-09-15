@@ -113,7 +113,7 @@ std::string nvidia_input_scale_ini_value(NvidiaInputScale scale) {
         return "50";
     case NvidiaInputScale::full:
     default:
-        return "100";
+        return "105";
     }
 }
 
@@ -211,6 +211,7 @@ std::string build_implicit_layer_manifest(
 std::string build_runtime_ini(
     const LauncherSettings& settings) {
     return "[ofxr]\r\nbackend=" + backend_ini_value(settings.backend) +
+           "\r\nmotion_vectors=dlss" +
            "\r\nnvidia_preset=" +
            nvidia_preset_ini_value(settings.nvidia_preset) +
            "\r\nnvidia_input_scale=" +

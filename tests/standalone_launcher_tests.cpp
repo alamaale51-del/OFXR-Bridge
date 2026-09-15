@@ -37,6 +37,7 @@ int main() {
         release_defaults.nvidia_input_scale != NvidiaInputScale::half ||
         release_defaults.nvidia_bidirectional || release_defaults.diagnostics ||
         !contains(default_runtime_ini, "[ofxr]\r\nbackend=fidelityfx") ||
+        !contains(default_runtime_ini, "motion_vectors=dlss") ||
         !contains(default_runtime_ini, "nvidia_preset=medium") ||
         !contains(default_runtime_ini, "nvidia_input_scale=50") ||
         !contains(default_runtime_ini, "[diagnostics]\r\nlogging_enabled=0")) {
@@ -109,17 +110,24 @@ int main() {
         std::to_wstring(GetTickCount64());
     std::wstring registry_error;
     const bool registered = xrfg::implicit_layer::register_manifest(
-        implicit_manifest, &registry_error, test_subkey);
+        implicit_manifest, xrfg::implicit_layer::RegistryScope::current_user,
+        &registry_error, test_subkey);
     const bool visible_before_probe =
-        xrfg::implicit_layer::manifest_registered(implicit_manifest, test_subkey);
+        xrfg::implicit_layer::manifest_registered(
+            implicit_manifest, xrfg::implicit_layer::RegistryScope::current_user,
+            test_subkey);
     // V017 deliberately has no loader-negotiation consumption path: repeated
     // OpenXR probes must leave the manual arm untouched until tray disarm.
     const bool visible_after_probe =
-        xrfg::implicit_layer::manifest_registered(implicit_manifest, test_subkey);
+        xrfg::implicit_layer::manifest_registered(
+            implicit_manifest, xrfg::implicit_layer::RegistryScope::current_user,
+            test_subkey);
     const bool unregistered = xrfg::implicit_layer::unregister_manifest(
-        implicit_manifest, &registry_error, test_subkey);
+        implicit_manifest, xrfg::implicit_layer::RegistryScope::current_user,
+        &registry_error, test_subkey);
     const bool removed = !xrfg::implicit_layer::manifest_registered(
-        implicit_manifest, test_subkey);
+        implicit_manifest, xrfg::implicit_layer::RegistryScope::current_user,
+        test_subkey);
     static_cast<void>(RegDeleteKeyW(HKEY_CURRENT_USER, test_subkey.c_str()));
     static_cast<void>(RegDeleteKeyW(
         HKEY_CURRENT_USER, L"Software\\OFXRBridgeTest"));
